@@ -1,0 +1,19 @@
+language = "C"
+include_guard = "LATTE_H"
+autogen_warning = "/* Generated from latte-core/src/ffi.rs by cbindgen. Edit the Rust source, not this file. */"
+sys_includes = ["stdint.h", "stddef.h"]
+no_includes = true
+documentation = true
+documentation_style = "c"
+cpp_compat = true
+usize_is_size_t = true
+
+[parse]
+parse_deps = false
+
+[export]
+include = ["LatteRecord", "LatteRing"]
+exclude = ["PRINT_RETRY_ERROR_LIMIT", "AlternatorOp"]
+
+[enum]
+prefix_with_name = true

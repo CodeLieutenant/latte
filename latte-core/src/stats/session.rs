@@ -1,0 +1,99 @@
+use crate::config::PRINT_RETRY_ERROR_LIMIT;
+use crate::stats::latency::LatencyDistributionRecorder;
+use crate::stats::value::MetricValue;
+use crate::stats::value::ValueDistributionRecorder;
+use rustc_hash::FxHashMap;
+use std::collections::HashSet;
+use std::time::Duration;
+
+/// Name of the custom metric that holds how late hosts start ops after their send time.
+pub const SEND_JITTER_METRIC: &str = "send_jitter_ms";
+
+#[derive(Clone, Debug)]
+pub struct SessionStats {
+    pub req_count: u64,
+    pub req_errors: HashSet<String>,
+    pub req_error_count: u64,
+    pub req_retry_errors: HashSet<String>,
+    pub req_retry_count: u64,
+    pub row_count: u64,
+    pub queue_length: u64,
+    pub mean_queue_length: f32,
+    pub resp_times_ns: LatencyDistributionRecorder,
+    /// Keyed by metric name with a fast hash, because every op records one metric.
+    pub custom_metrics: FxHashMap<String, ValueDistributionRecorder>,
+}
+
+impl SessionStats {
+    pub fn new() -> SessionStats {
+        Default::default()
+    }
+
+    pub fn start_request(&mut self) {
+        if self.req_count > 0 {
+            self.mean_queue_length +=
+                (self.queue_length as f32 - self.mean_queue_length) / self.req_count as f32;
+        }
+        self.queue_length += 1;
+    }
+
+    pub fn complete_request(&mut self, duration: Duration, row_count: u64) {
+        self.queue_length -= 1;
+        self.resp_times_ns.record(duration);
+        self.req_count += 1;
+        self.row_count += row_count;
+    }
+
+    pub fn record_metric(&mut self, name: &str, value: f64) {
+        // Called every cycle: avoid allocating the key on the hot path when the
+        // metric already exists.
+        if let Some(recorder) = self.custom_metrics.get_mut(name) {
+            recorder.record(MetricValue(value));
+        } else {
+            self.custom_metrics
+                .entry(name.to_string())
+                .or_default()
+                .record(MetricValue(value));
+        }
+    }
+
+    pub fn store_retry_error(&mut self, error_str: String) {
+        self.req_retry_count += 1;
+        if self.req_retry_count <= PRINT_RETRY_ERROR_LIMIT {
+            self.req_retry_errors.insert(error_str);
+        }
+    }
+
+    /// Resets all accumulators
+    pub fn reset(&mut self) {
+        self.req_error_count = 0;
+        self.row_count = 0;
+        self.req_count = 0;
+        self.req_retry_count = 0;
+        self.mean_queue_length = 0.0;
+        self.req_errors.clear();
+        self.req_retry_errors.clear();
+        self.resp_times_ns.clear();
+        self.custom_metrics.clear();
+
+        // note that current queue_length is *not* reset to zero because there
+        // might be pending requests and if we set it to zero, that would underflow
+    }
+}
+
+impl Default for SessionStats {
+    fn default() -> Self {
+        SessionStats {
+            req_count: 0,
+            req_errors: HashSet::new(),
+            req_error_count: 0,
+            req_retry_errors: HashSet::new(),
+            req_retry_count: 0,
+            row_count: 0,
+            queue_length: 0,
+            mean_queue_length: 0.0,
+            resp_times_ns: LatencyDistributionRecorder::default(),
+            custom_metrics: FxHashMap::default(),
+        }
+    }
+}

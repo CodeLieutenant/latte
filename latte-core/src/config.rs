@@ -1,0 +1,1005 @@
+use std::collections::HashMap;
+use std::error::Error;
+use std::fmt::{Display, Formatter};
+use std::num::NonZeroUsize;
+use std::path::PathBuf;
+use std::str::FromStr;
+use std::time::Duration;
+
+use anyhow::anyhow;
+use chrono::Utc;
+use clap::{Parser, ValueEnum};
+use itertools::Itertools;
+use serde::{Deserialize, Serialize};
+
+use crate::scripting::db_config;
+
+/// Limit of retry errors to be kept and then printed in scope of a sampling interval
+pub const PRINT_RETRY_ERROR_LIMIT: u64 = 5;
+
+/// Parses a duration string. Supports humantime format (e.g. "5s", "1m 30s") and
+/// bare numbers which are interpreted as seconds for backward compatibility.
+fn parse_duration(s: &str) -> Result<Duration, String> {
+    humantime::parse_duration(s).or_else(|_| {
+        s.parse::<f64>()
+            .map(Duration::from_secs_f64)
+            .map_err(|e| e.to_string())
+    })
+}
+
+fn parse_f64(s: &str) -> Result<f64, String> {
+    let parsed_value: f64 = s.parse().map_err(|_| format!("Invalid float: {s}"))?;
+    if (0.0..=1.0).contains(&parsed_value) {
+        Ok(parsed_value)
+    } else {
+        Err("Value must be between 0.0 and 1.0".to_string())
+    }
+}
+
+/// Parse a single key-value pair
+pub(crate) fn parse_key_val<T, U>(s: &str) -> Result<(T, U), anyhow::Error>
+where
+    T: std::str::FromStr,
+    T::Err: Error + Send + Sync + 'static,
+    U: std::str::FromStr,
+    U::Err: Error + Send + Sync + 'static,
+{
+    let pos = s
+        .find('=')
+        .ok_or_else(|| anyhow!("invalid KEY=value: no `=` found in `{}`", s))?;
+    Ok((s[..pos].parse()?, s[pos + 1..].parse()?))
+}
+
+/// Controls how long the benchmark should run.
+/// We can specify either a time-based duration or a number of calls to perform.
+/// It is also used for controlling sampling.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub enum Interval {
+    Count(u64),
+    Time(std::time::Duration),
+    Unbounded,
+}
+
+impl Interval {
+    pub fn is_not_zero(&self) -> bool {
+        match self {
+            Interval::Count(cnt) => *cnt > 0,
+            Interval::Time(d) => !d.is_zero(),
+            Interval::Unbounded => false,
+        }
+    }
+
+    pub fn is_bounded(&self) -> bool {
+        !matches!(self, Interval::Unbounded)
+    }
+
+    pub fn count(&self) -> Option<u64> {
+        if let Interval::Count(c) = self {
+            Some(*c)
+        } else {
+            None
+        }
+    }
+
+    pub fn period(&self) -> Option<std::time::Duration> {
+        if let Interval::Time(d) = self {
+            Some(*d)
+        } else {
+            None
+        }
+    }
+
+    pub fn period_secs(&self) -> Option<f32> {
+        if let Interval::Time(d) = self {
+            Some(d.as_secs_f32())
+        } else {
+            None
+        }
+    }
+}
+
+/// If the string is a valid integer, it is assumed to be the number of cycles.
+/// If the string additionally contains a time unit, e.g. "s" or "secs", it is parsed
+/// as time duration.
+impl FromStr for Interval {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if let Ok(i) = s.parse() {
+            Ok(Interval::Count(i))
+        } else if let Ok(d) = parse_duration(s) {
+            Ok(Interval::Time(d))
+        } else {
+            Err("Required integer number of cycles or time duration".to_string())
+        }
+    }
+}
+
+/// Controls the min and max retry interval for retry mechanism
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct RetryInterval {
+    pub min: Duration,
+    pub max: Duration,
+}
+
+impl RetryInterval {
+    pub fn new(time: &str) -> Option<Self> {
+        let values: Vec<&str> = time.split(',').collect();
+        if values.len() > 2 {
+            return None;
+        }
+        let min = parse_duration(values.first().unwrap_or(&"")).ok()?;
+        let max = parse_duration(values.get(1).unwrap_or(&""))
+            .ok()
+            .unwrap_or(min);
+        if min > max {
+            None
+        } else {
+            Some(RetryInterval { min, max })
+        }
+    }
+}
+
+impl FromStr for RetryInterval {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if let Some(interval) = RetryInterval::new(s) {
+            Ok(interval)
+        } else {
+            Err(concat!(
+                "Expected 1 or 2 parts separated by comma such as '500ms' or '200ms,5s' or '1s'.",
+                " First value cannot be bigger than second one.",
+            )
+            .to_string())
+        }
+    }
+}
+
+#[derive(Parser, Debug, Serialize, Deserialize)]
+pub struct ConnectionConf {
+    /// List of addresses to connect to.
+    #[clap(name = "addresses", default_value = "localhost")]
+    pub addresses: Vec<String>,
+
+    #[clap(
+        long("request-timeout"),
+        default_value = "5s",
+        value_name = "DURATION",
+        value_parser = parse_duration
+    )]
+    pub request_timeout: Duration,
+
+    /// Extra time to wait for ops in flight after the schedule ends or the run is cancelled,
+    /// on top of the request timeout. Ops still in flight after it count as end-of-run
+    /// timeouts, not as errors.
+    #[serde(default = "default_drain_margin")]
+    #[clap(
+        long("drain-margin"),
+        default_value = "1s",
+        value_name = "DURATION",
+        value_parser = parse_duration
+    )]
+    pub drain_margin: Duration,
+
+    /// Rune instructions one cycle may run before the core stops it, so a script stuck in a
+    /// loop still sees a cancel. 0 means no limit.
+    #[serde(default = "default_rune_budget")]
+    #[clap(
+        long("rune-budget"),
+        default_value = "1000000000",
+        value_name = "COUNT"
+    )]
+    pub rune_budget: usize,
+
+    /// Page size defines the number of rows to get in a single select-query
+    #[clap(long("page-size"), default_value = "501", value_name = "COUNT")]
+    pub page_size: NonZeroUsize,
+
+    /// Number of retries after the first failed attempt of a query (and of a whole cycle
+    /// with `--validation-strategy=retry`). 0 sends each query once.
+    #[clap(
+        long("retry-number"),
+        aliases = &["retries"],
+        default_value = "10",
+        value_name = "COUNT"
+    )]
+    pub retry_number: u64,
+
+    #[clap(
+        long("retry-interval"),
+        default_value = "100ms,5s",
+        value_name = "MIN[,MAX]"
+    )]
+    pub retry_interval: RetryInterval,
+
+    /// Validation strategy is used in the following cases:
+    /// - Defines the strategy for 'select' queries validation errors.
+    ///   Gets applied when 'execute_prepared_with_validation'
+    ///   or 'execute_with_validation' context methods are used in rune scripts.
+    /// - Defines the behavior of latte when 'signal_failure' context method
+    ///   is executed. So, having "retry" validation strategy it will retry
+    ///   whole rune function using common retry configs for count and interval.
+    #[clap(
+        long("validation-strategy"),
+        required = false,
+        default_value = "fail-fast"
+    )]
+    pub validation_strategy: ValidationStrategy,
+
+    /// Datacenter to route requests to.
+    #[clap(long("datacenter"), required = false, value_name = "DC")]
+    pub datacenter: Option<String>,
+
+    /// Rack to route requests to.
+    #[clap(
+        long("rack"),
+        required = false,
+        value_name = "RACK",
+        requires = "datacenter"
+    )]
+    pub rack: Option<String>,
+
+    #[clap(flatten)]
+    #[serde(flatten)]
+    pub db: db_config::DbConnectionConf,
+
+    /// Alternator client tuning (request compression and header handling).
+    #[cfg(feature = "alternator")]
+    #[clap(flatten)]
+    #[serde(flatten)]
+    pub alternator: db_config::AlternatorConnectionOpts,
+}
+
+#[derive(Clone, Copy, Default, Debug, Eq, PartialEq, Serialize, Deserialize, ValueEnum)]
+pub enum ValidationStrategy {
+    Retry, // Retry 'select' queries if rows number is unexpected.
+    #[default]
+    FailFast, // Stop stress execution right after any 'select' query validation fails.
+    Ignore, // Ignore validation errors - face, print, go on.
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WeightedFunction {
+    pub name: String,
+    pub weight: f64,
+}
+
+impl FromStr for WeightedFunction {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if !s.contains(':') {
+            Ok(Self {
+                name: s.to_string(),
+                weight: 1.0,
+            })
+        } else if let Some((name, weight)) = s.split(':').collect_tuple() {
+            let weight: f64 = weight
+                .parse()
+                .map_err(|e| format!("Invalid weight value: {e}"))?;
+            if weight < 0.0 {
+                return Err("Weight must be greater or equal 0.0".to_string());
+            }
+            Ok(Self {
+                name: name.to_string(),
+                weight,
+            })
+        } else {
+            Err("Failed to parse function specification. Expected <NAME>[:WEIGHT]".to_string())
+        }
+    }
+}
+
+impl Display for WeightedFunction {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.name, self.weight)
+    }
+}
+
+#[derive(Parser, Debug, Serialize, Deserialize)]
+pub struct RateConf {
+    /// Number of cycles per second to execute.
+    /// If not given, the load cycles will be executed as fast as possible.
+    #[clap(short('r'), long, value_name = "COUNT")]
+    pub rate: Option<f64>,
+
+    /// Used to enable the 'sinusoidal' rate generation and defines
+    /// the relative value (0.0..1.0) for the variation from the main rate (sine amplitude).
+    /// Requires the "rate" option to be defined.
+    #[clap(
+        long("rate-sine-amplitude"),
+        aliases = &["rate-amplitude", "rate-sine-variation", "rate-variation"],
+        value_parser = parse_f64,
+        value_name = "RATE-MULTIPLIER",
+    )]
+    pub rate_sine_amplitude: Option<f64>,
+
+    /// Used for the 'sinusoidal' rate generation as a definition of the rate sine wave period.
+    #[clap(
+        long("rate-sine-period"),
+        aliases = &["sine-period"],
+        default_value = "1m",
+        value_name = "DURATION",
+        value_parser = parse_duration,
+    )]
+    pub rate_sine_period: Duration,
+}
+
+#[derive(Parser, Debug, Serialize, Deserialize)]
+#[command(next_line_help = true)]
+pub struct EditCommand {
+    /// Path to the workload definition file.
+    #[clap(name = "workload", required = true, value_name = "PATH")]
+    pub workload: PathBuf,
+}
+
+#[derive(Parser, Debug, Serialize, Deserialize)]
+#[command(next_line_help = true)]
+pub struct SchemaCommand {
+    /// Parameter values passed to the workload, accessible through param! macro.
+    #[clap(short('P'), value_parser = parse_key_val::<String, String>, number_of_values = 1)]
+    pub params: Vec<(String, String)>,
+
+    /// Path to the workload definition file.
+    #[clap(name = "workload", required = true, value_name = "PATH")]
+    pub workload: PathBuf,
+
+    // Connection settings.
+    #[clap(flatten)]
+    pub connection: ConnectionConf,
+}
+
+#[derive(Parser, Debug, Serialize, Deserialize)]
+#[command(next_line_help = true)]
+pub struct LoadCommand {
+    #[clap(flatten)]
+    pub rate: RateConf,
+
+    /// Number of worker threads used by the driver.
+    #[clap(short('t'), long, default_value = "1", value_name = "COUNT")]
+    pub threads: NonZeroUsize,
+
+    /// Max number of concurrent async requests per thread during data loading phase.
+    #[clap(long, default_value = "512", value_name = "COUNT")]
+    pub concurrency: NonZeroUsize,
+
+    /// Parameter values passed to the workload, accessible through param! macro.
+    #[clap(short('P'), value_parser = parse_key_val::<String, String>, number_of_values = 1)]
+    pub params: Vec<(String, String)>,
+
+    /// Don't display the progress bar.
+    #[clap(short, long)]
+    pub quiet: bool,
+
+    /// Path to the workload definition file.
+    #[clap(name = "workload", required = true, value_name = "PATH")]
+    pub workload: PathBuf,
+
+    // Connection settings.
+    #[clap(flatten)]
+    pub connection: ConnectionConf,
+}
+
+#[derive(Parser, Debug, Serialize, Deserialize)]
+#[command(next_line_help = true)]
+pub struct RunCommand {
+    #[clap(flatten)]
+    pub rate: RateConf,
+
+    /// Number of cycles or duration of the warmup phase.
+    #[clap(
+        short('w'),
+        long("warmup"),
+        default_value = "1",
+        value_name = "TIME | COUNT"
+    )]
+    pub warmup_duration: Interval,
+
+    /// Number of cycles or duration of the main benchmark phase.
+    #[clap(
+        short('d'),
+        long("duration"),
+        default_value = "60s",
+        value_name = "TIME | COUNT"
+    )]
+    pub run_duration: Interval,
+
+    /// The initial value of the cycle counter.
+    ///
+    /// Normally the cycle counter starts from 0, but you can start from a different value.
+    /// This is particularly useful for splitting the workload into
+    /// parts executed from different client nodes.
+    #[clap(long, default_value = "0")]
+    pub start_cycle: i64,
+
+    /// The maximum value of the cycle counter at which the cycle counter wraps-around back
+    /// to the start value.
+    #[clap(long, default_value = "9223372036854775807")]
+    pub end_cycle: i64,
+
+    /// Number of worker threads used by the driver.
+    #[clap(short('t'), long, default_value = "1", value_name = "COUNT")]
+    pub threads: NonZeroUsize,
+
+    /// Max number of concurrent async requests per thread during the main benchmark phase.
+    #[clap(short('p'), long, default_value = "128", value_name = "COUNT")]
+    pub concurrency: NonZeroUsize,
+
+    /// Sampling period, in seconds.
+    ///
+    /// While running the workload, periodically takes a snapshot of the statistics
+    /// and records it as a separate data point in the log. At the end, the log gets saved to
+    /// the final report. The sampling log can be used later for generating plots
+    /// or HDR histogram logs for further detailed data analysis.
+    ///
+    /// Sampling period does not affect the value of the final statistics computed
+    /// for the whole run. You'll not get more accurate measurements by sampling more frequently
+    /// (assuming the same total length of the run).   
+    ///
+    /// The sampling log is used for analyzing throughput fluctuations and the number of samples
+    /// does affect the accuracy of estimating the throughput error to some degree.
+    /// The throughput error estimate may be inaccurate if you collect less than 10 samples.  
+    #[clap(
+        short('s'),
+        long("sampling"),
+        default_value = "1s",
+        value_name = "TIME | COUNT"
+    )]
+    pub sampling_interval: Interval,
+
+    /// Label that will be added to the report to help identifying the test
+    #[clap(long("tag"), value_delimiter = ',')]
+    pub tags: Vec<String>,
+
+    /// Whether to generate final report or not. If disabled (default) then memory consumption will
+    /// be static, otherwise it will leak linearly storing samples info for a final report
+    /// calculation.
+    #[clap(long("generate-report"), required = false)]
+    pub generate_report: bool,
+
+    /// Path to a file for streaming HDR histogram data in real-time.
+    #[clap(
+        long("hdrfile"),
+        aliases = &["hdr-file", "hdr-histogram", "hdr-histogram-file"],
+        required = false
+    )]
+    pub hdrfile: Option<PathBuf>,
+
+    /// Path to an output file or directory where the JSON report should be written to.
+    #[clap(short('o'), long)]
+    #[serde(skip)]
+    pub output: Option<PathBuf>,
+
+    /// Path to a report from another earlier run that should be compared to side-by-side
+    #[clap(short('b'), long, value_name = "PATH")]
+    pub baseline: Option<PathBuf>,
+
+    /// Path to the workload definition file.
+    #[clap(name = "workload", required = true, value_name = "PATH")]
+    pub workload: PathBuf,
+
+    /// Function of the workload to invoke.
+    #[clap(
+        long("function"),
+        aliases = &["functions"],
+        short('f'),
+        required = false,
+        default_value = "run",
+        value_delimiter = ','
+    )]
+    pub functions: Vec<WeightedFunction>,
+
+    /// Parameter values passed to the workload, accessible through param! macro.
+    #[clap(short('P'), value_parser = parse_key_val::<String, String>, number_of_values = 1)]
+    pub params: Vec<(String, String)>,
+
+    /// Don't display the progress bar.
+    #[clap(short, long)]
+    pub quiet: bool,
+
+    // Connection settings.
+    #[clap(flatten)]
+    pub connection: ConnectionConf,
+
+    /// Seconds since 1970-01-01T00:00:00Z
+    #[clap(hide = true, long)]
+    pub timestamp: Option<i64>,
+
+    #[clap(skip)]
+    pub cluster_name: Option<String>,
+
+    #[clap(skip)]
+    pub db_version: Option<String>,
+
+    /// Effective settings of the driver that ran the benchmark, as the host reported them.
+    #[clap(skip)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver_settings: Option<serde_json::Value>,
+
+    #[clap(skip)]
+    pub id: Option<String>,
+}
+
+impl RunCommand {
+    pub fn set_timestamp_if_empty(mut self) -> Self {
+        if self.timestamp.is_none() {
+            self.timestamp = Some(Utc::now().timestamp())
+        }
+        self
+    }
+
+    /// Returns the value of parameter under given key.
+    /// If key doesn't exist, or parameter is not a number, returns `None`.
+    pub fn get_param(&self, key: &str) -> Option<f64> {
+        self.params
+            .iter()
+            .find(|(k, _)| k == key)
+            .and_then(|v| v.1.parse().ok())
+    }
+}
+
+#[derive(Parser, Debug)]
+pub struct ListCommand {
+    /// Lists only the runs of specified workload.
+    #[clap()]
+    pub workload: Option<String>,
+
+    /// Lists only the runs of given function.
+    #[clap(long, short('f'))]
+    pub function: Option<String>,
+
+    /// Lists only the runs with specified tags.
+    #[clap(long("tag"), value_delimiter = ',')]
+    pub tags: Vec<String>,
+
+    /// Path to JSON reports directory where the JSON reports were written to.
+    #[clap(long, short('o'), long, default_value = ".", number_of_values = 1)]
+    pub output: Vec<PathBuf>,
+
+    /// Descends into subdirectories recursively.
+    #[clap(short('r'), long)]
+    pub recursive: bool,
+}
+
+#[derive(Parser, Debug)]
+pub struct ShowCommand {
+    /// Path to the JSON report file
+    #[clap(value_name = "PATH")]
+    pub report: PathBuf,
+
+    /// Optional path to another JSON report file
+    #[clap(short('b'), long, value_name = "PATH")]
+    pub baseline: Option<PathBuf>,
+}
+
+#[derive(Parser, Debug)]
+pub struct HdrCommand {
+    /// Path to the input JSON report file
+    #[clap(value_name = "PATH")]
+    pub report: PathBuf,
+
+    /// Output file; if not given, the hdr log gets printed to stdout
+    #[clap(short('o'), long, value_name = "PATH")]
+    pub output: Option<PathBuf>,
+
+    /// Optional tag prefix to add to each histogram
+    #[clap(long, value_name = "STRING")]
+    pub tag: Option<String>,
+}
+
+#[derive(Parser, Debug)]
+pub struct PlotCommand {
+    /// Path to the input JSON report file(s)
+    #[clap(value_name = "PATH", required = true)]
+    pub reports: Vec<PathBuf>,
+
+    /// Plot given response time percentiles. Can be used multiple times.
+    #[clap(short, long("percentile"), number_of_values = 1)]
+    pub percentiles: Vec<f64>,
+
+    /// Plot throughput.
+    #[clap(short, long("throughput"))]
+    pub throughput: bool,
+
+    /// Write output to the given file.
+    #[clap(short('o'), long, value_name = "PATH")]
+    pub output: Option<PathBuf>,
+}
+
+#[derive(Parser, Debug)]
+pub struct VersionCommand {
+    /// Whether to output version info in json format or not
+    #[clap(long, short('j'), required = false)]
+    pub json: bool,
+}
+
+#[derive(Parser, Debug)]
+#[allow(clippy::large_enum_variant)]
+pub enum Command {
+    /// Opens the specified workload script file for editing.
+    ///
+    /// Searches for the script on the workload search path. Workload files
+    /// are first searched in the current working directory, next in the paths
+    /// specified by LATTE_WORKLOAD_PATH environment variable. If the variable
+    /// is not defined, `/usr/share/latte/workloads` and `.local/share/latte/workloads`
+    /// are searched.
+    ///
+    /// Opens the editor pointed by LATTE_EDITOR or EDITOR environment variable.
+    /// If no variable is set, tries to launch vi.
+    ///
+    Edit(EditCommand),
+
+    /// Creates the database schema by invoking the `schema` function of the workload script.
+    ///
+    /// The function should remove the old schema if present.
+    /// Calling this is likely to remove data from the database.
+    Schema(SchemaCommand),
+
+    /// Erases and generates fresh data needed for the benchmark by invoking the `erase` and `load`
+    /// functions of the workload script.
+    ///
+    /// Running this command is typically needed by read benchmarks.
+    /// You need to create the schema before.
+    Load(LoadCommand),
+
+    /// Runs the benchmark.
+    ///
+    /// Prints nicely formatted statistics to the standard output.
+    /// Additionally dumps all data into a JSON report file.
+    Run(RunCommand),
+
+    /// Lists benchmark reports saved in the current or specified directory
+    /// with summaries of their results.
+    List(ListCommand),
+
+    /// Displays the report(s) of previously executed benchmark(s).
+    ///
+    /// Can compare two runs.
+    Show(ShowCommand),
+
+    /// Exports histograms as a compressed HDR interval log.
+    ///
+    /// To be used with HdrHistogram (https://github.com/HdrHistogram/HdrHistogram).
+    /// Timestamps are given in seconds since Unix epoch.
+    /// Response times are recorded in nanoseconds.
+    Hdr(HdrCommand),
+
+    /// Plots recorded samples. Saves output in SVG format.
+    Plot(PlotCommand),
+
+    /// Outputs Latte and Scylla driver versions
+    Version(VersionCommand),
+}
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "Latency and Throughput Tester for Cassandra and ScyllaDB",
+    author = "Piotr Kołaczkowski <pkolaczk@datastax.com>"
+)]
+pub struct AppConfig {
+    /// Name of the log file.
+    ///
+    /// If not given, the log file name will be created automatically based on the current timestamp.
+    /// If relative path given, the file will be placed in the directory determined by `log-dir`.
+    /// The log file will store detailed information about e.g. query errors.
+    #[clap(long("log-file"))]
+    pub log_file: Option<PathBuf>,
+
+    /// Directory where log files are stored.
+    #[clap(long("log-dir"), env("LATTE_LOG_DIR"), default_value = ".")]
+    pub log_dir: PathBuf,
+
+    /// Whether to create log file and write to it or not.
+    #[clap(long("enable-logging"), required = false)]
+    pub enable_logging: bool,
+
+    #[clap(subcommand)]
+    pub command: Command,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[allow(unused)]
+pub struct SchemaConfig {
+    #[serde(default)]
+    pub script: Vec<String>,
+    #[serde(default)]
+    pub cql: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(unused)]
+pub struct LoadConfig {
+    pub count: u64,
+    #[serde(default)]
+    pub script: Vec<String>,
+    #[serde(default)]
+    pub cql: String,
+}
+
+mod defaults {
+    pub fn ratio() -> f64 {
+        1.0
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(unused)]
+pub struct RunConfig {
+    #[serde(default = "defaults::ratio")]
+    pub ratio: f64,
+    #[serde(default)]
+    pub script: Vec<String>,
+    #[serde(default)]
+    pub cql: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(unused)]
+pub struct WorkloadConfig {
+    #[serde(default)]
+    pub schema: SchemaConfig,
+    #[serde(default)]
+    pub load: HashMap<String, LoadConfig>,
+    pub run: HashMap<String, RunConfig>,
+    #[serde(default)]
+    pub bindings: HashMap<String, String>,
+}
+
+fn default_drain_margin() -> Duration {
+    Duration::from_secs(1)
+}
+
+fn default_rune_budget() -> usize {
+    1_000_000_000
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    mod parse_duration_tests {
+        use super::*;
+
+        #[test]
+        fn humantime_seconds() {
+            assert_eq!(parse_duration("5s").unwrap(), Duration::from_secs(5));
+        }
+
+        #[test]
+        fn humantime_minutes() {
+            assert_eq!(parse_duration("3m").unwrap(), Duration::from_secs(180));
+        }
+
+        #[test]
+        fn humantime_milliseconds() {
+            assert_eq!(parse_duration("500ms").unwrap(), Duration::from_millis(500));
+        }
+
+        #[test]
+        fn humantime_composite() {
+            assert_eq!(parse_duration("1m 30s").unwrap(), Duration::from_secs(90));
+        }
+
+        #[test]
+        fn bare_integer_as_seconds() {
+            assert_eq!(parse_duration("60").unwrap(), Duration::from_secs(60));
+        }
+
+        #[test]
+        fn bare_float_as_seconds() {
+            let d = parse_duration("1.5").unwrap();
+            assert_eq!(d, Duration::from_millis(1500));
+        }
+
+        #[test]
+        fn bare_zero() {
+            assert_eq!(parse_duration("0").unwrap(), Duration::from_secs(0));
+        }
+
+        #[test]
+        fn empty_string_is_error() {
+            assert!(parse_duration("").is_err());
+        }
+
+        #[test]
+        fn garbage_is_error() {
+            assert!(parse_duration("abc").is_err());
+        }
+
+        #[test]
+        fn fractional_with_unit() {
+            // humantime supports fractional values with units (e.g. "1.5s"),
+            // preserving backward compatibility with the old parse_duration crate.
+            assert_eq!(parse_duration("1.5s").unwrap(), Duration::from_millis(1500));
+        }
+    }
+
+    mod interval_tests {
+        use super::*;
+
+        #[test]
+        fn integer_parses_as_count() {
+            let interval: Interval = "1000".parse().unwrap();
+            assert_eq!(interval.count(), Some(1000));
+        }
+
+        #[test]
+        fn time_string_parses_as_time() {
+            let interval: Interval = "120m".parse().unwrap();
+            assert_eq!(interval.period(), Some(Duration::from_secs(7200)));
+        }
+
+        #[test]
+        fn seconds_suffix_parses_as_time() {
+            let interval: Interval = "5s".parse().unwrap();
+            assert_eq!(interval.period(), Some(Duration::from_secs(5)));
+        }
+
+        #[test]
+        fn invalid_string_is_error() {
+            assert!("abc".parse::<Interval>().is_err());
+        }
+    }
+
+    mod retry_interval_tests {
+        use super::*;
+
+        #[test]
+        fn min_and_max() {
+            let ri = RetryInterval::new("2s,10s").unwrap();
+            assert_eq!(ri.min, Duration::from_secs(2));
+            assert_eq!(ri.max, Duration::from_secs(10));
+        }
+
+        #[test]
+        fn milliseconds_and_seconds() {
+            let ri = RetryInterval::new("500ms,5s").unwrap();
+            assert_eq!(ri.min, Duration::from_millis(500));
+            assert_eq!(ri.max, Duration::from_secs(5));
+        }
+
+        #[test]
+        fn single_value_sets_min_equal_to_max() {
+            let ri = RetryInterval::new("5s").unwrap();
+            assert_eq!(ri.min, Duration::from_secs(5));
+            assert_eq!(ri.max, Duration::from_secs(5));
+        }
+
+        #[test]
+        fn bare_number_as_seconds() {
+            let ri = RetryInterval::new("60").unwrap();
+            assert_eq!(ri.min, Duration::from_secs(60));
+            assert_eq!(ri.max, Duration::from_secs(60));
+        }
+
+        #[test]
+        fn min_greater_than_max_returns_none() {
+            assert!(RetryInterval::new("10s,2s").is_none());
+        }
+
+        #[test]
+        fn too_many_values_returns_none() {
+            assert!(RetryInterval::new("1s,2s,3s").is_none());
+        }
+
+        #[test]
+        fn empty_string_returns_none() {
+            assert!(RetryInterval::new("").is_none());
+        }
+    }
+
+    #[cfg(feature = "alternator")]
+    mod alternator_connection_opts_tests {
+        use super::SchemaCommand;
+        use crate::scripting::db_config::{
+            AlternatorKeyRouteAffinity, AlternatorRequestCompressionMode,
+        };
+        use clap::Parser;
+
+        fn parse_schema(args: &[&str]) -> SchemaCommand {
+            SchemaCommand::try_parse_from(std::iter::once("latte").chain(args.iter().copied()))
+                .unwrap()
+        }
+
+        #[test]
+        fn default_options() {
+            let c = parse_schema(&["w.rn", "http://h:1"]);
+            assert_eq!(
+                c.connection.alternator.request_compression,
+                AlternatorRequestCompressionMode::DriverDefault
+            );
+            assert!(c.connection.alternator.optimize_headers.is_none());
+            assert_eq!(c.connection.alternator.compression_threshold, 1024);
+            assert!(c.connection.alternator.compression_level.is_none());
+            assert!(c.connection.alternator.active_interval.is_none());
+            assert!(c.connection.alternator.idle_interval.is_none());
+            assert!(c.connection.datacenter.is_none());
+            assert!(c.connection.rack.is_none());
+            assert!(c.connection.alternator.routing_fallback.is_none());
+            assert!(c.connection.alternator.key_route_affinity.is_none());
+            assert!(c.connection.alternator.key_route_affinity_tables.is_empty());
+        }
+
+        #[test]
+        fn parse_compression_flags() {
+            let c = parse_schema(&[
+                "w.rn",
+                "http://h:1",
+                "--request-compression",
+                "zlib",
+                "--optimize-headers",
+                "false",
+                "--compression-threshold",
+                "2048",
+                "--compression-level",
+                "7",
+            ]);
+            assert_eq!(
+                c.connection.alternator.request_compression,
+                AlternatorRequestCompressionMode::Zlib
+            );
+            assert_eq!(c.connection.alternator.optimize_headers, Some(false));
+            assert_eq!(c.connection.alternator.compression_threshold, 2048);
+            assert_eq!(c.connection.alternator.compression_level, Some(7));
+        }
+
+        #[test]
+        fn parse_optimization_flags() {
+            let c = parse_schema(&[
+                "w.rn",
+                "http://h:1",
+                "--active-interval",
+                "500",
+                "--idle-interval",
+                "30000",
+                "--datacenter",
+                "us-east-1",
+                "--rack",
+                "rack1a",
+                "--routing-fallback",
+                "false",
+                "--key-route-affinity",
+                "any-write",
+                "--key-route-affinity-table",
+                "users=user_id",
+                "--key-route-affinity-table",
+                "orders=order_id",
+            ]);
+            assert_eq!(c.connection.alternator.active_interval, Some(500));
+            assert_eq!(c.connection.alternator.idle_interval, Some(30000));
+            assert_eq!(c.connection.datacenter, Some("us-east-1".to_string()));
+            assert_eq!(c.connection.rack, Some("rack1a".to_string()));
+            assert_eq!(c.connection.alternator.routing_fallback, Some(false));
+            assert_eq!(
+                c.connection.alternator.key_route_affinity,
+                Some(AlternatorKeyRouteAffinity::AnyWrite)
+            );
+            assert_eq!(
+                c.connection.alternator.key_route_affinity_tables,
+                vec![
+                    ("users".to_string(), "user_id".to_string()),
+                    ("orders".to_string(), "order_id".to_string())
+                ]
+            );
+        }
+    }
+
+    #[cfg(feature = "alternator")]
+    mod parse_compression_level_tests {
+        use crate::scripting::db_config::parse_compression_level;
+
+        #[test]
+        fn accepts_levels_one_through_nine() {
+            for n in 1u8..=9u8 {
+                assert_eq!(parse_compression_level(&n.to_string()).unwrap(), n);
+            }
+        }
+
+        #[test]
+        fn rejects_out_of_range() {
+            assert!(parse_compression_level("0").is_err());
+            assert!(parse_compression_level("10").is_err());
+        }
+    }
+}

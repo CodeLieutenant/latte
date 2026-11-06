@@ -1,670 +1,122 @@
-use std::ffi::OsStr;
-use std::fs::File;
-use std::io::{stdout, Write};
-use std::path::{Path, PathBuf};
+//! The Rust host of the Latte core: it owns the database client and the event loops, runs
+//! the ops the core hands out and feeds the completions back. Everything else is in
+//! `latte-core`.
+//!
+//! Each worker thread runs one core instance on its own current-thread Tokio runtime, so a
+//! completion lands on the thread that owns the instance with no cross-thread queue. All
+//! workers share one client, whose connection tasks run on a separate driver runtime.
+//! The `latte` binary serves CQL and the `latte-alternator` binary serves Alternator.
+
 use std::process::exit;
-use std::time::{Duration, SystemTime};
-use std::{env, fs};
+use std::sync::Arc;
 
-use clap::{CommandFactory, FromArgMatches};
-use config::RunCommand;
-use futures::stream::FuturesUnordered;
-use futures::StreamExt;
-use hdrhistogram::serialization::{interval_log, V2DeflateSerializer};
-use itertools::Itertools;
-use rune::Source;
-use search_path::SearchPath;
+use latte_cli::host::run_worker;
+use latte_core::exec::run::{backend, start, thread_hint, Backend, Start};
+use latte_core::exec::runtime::CancelToken;
 use tokio::runtime::{Builder, Runtime};
-use tokio::task::spawn_blocking;
-use tracing::info;
-use tracing::level_filters::LevelFilter;
-use tracing_appender::non_blocking::WorkerGuard;
-use tracing_subscriber::EnvFilter;
-use walkdir::WalkDir;
 
-use crate::config::{
-    AppConfig, Command, ConnectionConf, EditCommand, HdrCommand, Interval, ListCommand,
-    LoadCommand, SchemaCommand, ShowCommand, VersionCommand,
-};
-use crate::error::{LatteError, Result};
-use crate::exec::{par_execute, ExecutionOptions};
-use crate::report::{PathAndSummary, Report, RunConfigCmp};
-use crate::scripting::cluster_info::ClusterInfo;
-use crate::scripting::context::Context;
-use crate::stats::histogram::HistogramWriter;
-use crate::stats::{BenchmarkCmp, BenchmarkStats, Recorder};
-use crate::version::{format_version_info_human, get_formatted_version_info};
-use exec::cycle::BoundedCycleCounter;
-use exec::progress::Progress;
-use exec::workload::{FnRef, Program, Workload, WorkloadStats, LOAD_FN};
-use report::plot::plot_graph;
-use report::table::{Alignment, Table};
+#[cfg(feature = "alternator")]
+use latte_cli::alternator as db;
+#[cfg(feature = "cql")]
+use latte_cli::cql as db;
 
-mod config;
-mod error;
-mod exec;
-mod report;
-mod scripting;
-mod stats;
-mod version;
+/// The backend this host binary serves.
+#[cfg(feature = "cql")]
+const HOST_BACKEND: Backend = Backend::Cql;
+#[cfg(feature = "alternator")]
+const HOST_BACKEND: Backend = Backend::Alternator;
 
-const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// The runtime that runs the connection tasks of the shared client.
+fn driver_runtime(thread_count: usize) -> std::io::Result<Runtime> {
+    Builder::new_multi_thread()
+        .worker_threads(thread_count)
+        .thread_name("latte-driver")
+        .enable_all()
+        .enable_alt_timer()
+        .build()
+}
 
-#[global_allocator]
-static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
-
-fn load_report_or_abort(path: &Path) -> Report {
-    match Report::load(path) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!(
-                "error: Failed to read report from {}: {}",
-                path.display(),
-                e
-            );
-            exit(1)
+/// Cancels the run on SIGINT (Ctrl-C) or SIGTERM.
+fn cancel_on_signals(runtime: &Runtime, token: CancelToken) {
+    runtime.spawn(async move {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            match signal(SignalKind::terminate()) {
+                Ok(mut term) => {
+                    tokio::select! {
+                        _ = tokio::signal::ctrl_c() => {}
+                        _ = term.recv() => {}
+                    }
+                }
+                Err(_) => {
+                    let _ = tokio::signal::ctrl_c().await;
+                }
+            }
         }
-    }
-}
-
-/// Reads the workload script from a file and compiles it.
-fn load_workload_script(workload: &Path, params: &[(String, String)]) -> Result<Program> {
-    let workload = find_workload(workload)
-        .canonicalize()
-        .unwrap_or_else(|_| workload.to_path_buf());
-    eprintln!("info: Loading workload script {}...", workload.display());
-    let src =
-        Source::from_path(&workload).map_err(|e| LatteError::ScriptRead(workload.clone(), e))?;
-    let program = Program::new(src, params.iter().cloned().collect())?;
-    info!(
-        "Loaded workload script {}\n\tParams: {:?}",
-        workload.display(),
-        params,
-    );
-    Ok(program)
-}
-
-/// Locates the workload and returns an absolute path to it.
-/// If not found, returns the original path unchanged.
-/// If the workload path is relative, it is searched in the directories
-/// listed by `LATTE_WORKLOAD_PATH` environment variable.
-/// If the variable is not set, workload is searched in
-/// `.local/share/latte/workloads` and `/usr/share/latte/workloads`.
-fn find_workload(workload: &Path) -> PathBuf {
-    if workload.starts_with(".") || workload.is_absolute() {
-        return workload.to_path_buf();
-    }
-    let search_path = SearchPath::new("LATTE_WORKLOAD_PATH").unwrap_or_else(|_| {
-        let relative_to_exe = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(Path::to_path_buf))
-            .map(|p| p.join("workloads"));
-        SearchPath::from(
-            [
-                PathBuf::from(".local/share/latte/workloads"),
-                PathBuf::from("/usr/share/latte/workloads"),
-            ]
-            .into_iter()
-            .chain(relative_to_exe)
-            .collect_vec(),
-        )
+        #[cfg(not(unix))]
+        let _ = tokio::signal::ctrl_c().await;
+        token.cancel();
     });
-    search_path
-        .find_file(workload)
-        .unwrap_or_else(|| workload.to_path_buf())
-}
-
-/// Connects to the server and returns the session.
-/// The 'client_id' ends up in 'system.clients' to tell concurrent latte calls apart.
-async fn connect(conf: &ConnectionConf, client_id: &str) -> Result<(Context, Option<ClusterInfo>)> {
-    eprintln!("info: Connecting to {:?}... ", conf.addresses);
-    let session = scripting::connect::connect(conf, client_id).await?;
-    let cluster_info = session.cluster_info().await?;
-    eprintln!(
-        "info: Connected to '{}' cluster running {}",
-        cluster_info
-            .as_ref()
-            .map(|c| c.name.as_str())
-            .unwrap_or("unknown"),
-        cluster_info
-            .as_ref()
-            .map(|c| c.db_version.as_str())
-            .unwrap_or("unknown")
-    );
-    Ok((session, cluster_info))
-}
-
-/// Runs the `schema` function of the workload script.
-/// Exits with error if the `schema` function is not present or fails.
-async fn schema(conf: SchemaCommand) -> Result<()> {
-    let mut program = load_workload_script(&conf.workload, &conf.params)?;
-    let (session, _) = connect(&conf.connection, "schema").await?;
-    if !program.has_schema() {
-        eprintln!("error: Function `schema` not found in the workload script.");
-        exit(255);
-    }
-    eprintln!("info: Creating schema...");
-    if let Err(e) = program.schema(&session).await {
-        eprintln!("error: Failed to create schema: {e}");
-        exit(255);
-    }
-    eprintln!("info: Schema created successfully");
-    Ok(())
-}
-
-/// Loads the data into the database.
-/// Exits with error if the `load` function is not present or fails.
-async fn load(conf: LoadCommand) -> Result<()> {
-    let mut program = load_workload_script(&conf.workload, &conf.params)?;
-    let (session, _) = connect(&conf.connection, "load").await?;
-
-    if program.has_prepare() {
-        eprintln!("info: Preparing...");
-        if let Err(e) = program.prepare(&session).await {
-            eprintln!("error: Failed to prepare: {e}");
-            exit(255);
-        }
-    }
-
-    let load_count = session.load_cycle_count();
-    if load_count > 0 && !program.has_load() {
-        eprintln!("error: Function `load` not found in the workload script.");
-        exit(255);
-    }
-
-    if program.has_erase() {
-        eprintln!("info: Erasing data...");
-        if let Err(e) = program.erase(&session).await {
-            eprintln!("error: Failed to erase: {e}");
-            exit(255);
-        }
-    }
-
-    eprintln!("info: Loading data...");
-    let loader = Workload::new(
-        session.clone()?,
-        program.clone(),
-        &[(FnRef::new(LOAD_FN), 1.0)],
-    );
-    let load_options = ExecutionOptions {
-        duration: config::Interval::Count(load_count),
-        cycle_range: (0, i64::MAX),
-        rate: conf.rate.rate,
-        rate_sine_amplitude: conf.rate.rate_sine_amplitude,
-        rate_sine_period: conf.rate.rate_sine_period,
-        threads: conf.threads,
-        concurrency: conf.concurrency,
-    };
-    let result = par_execute(
-        "Loading...",
-        &load_options,
-        config::Interval::Unbounded,
-        loader,
-        !conf.quiet,
-        false,
-        &mut None,
-    )
-    .await?;
-
-    if result.error_count > 0 {
-        for e in result.errors {
-            eprintln!("error: {e}");
-        }
-        eprintln!("error: Errors encountered when loading data. Some data might be missing.");
-        exit(255)
-    }
-    Ok(())
-}
-
-async fn run(conf: RunCommand) -> Result<()> {
-    let mut conf = conf.set_timestamp_if_empty();
-    let compare = conf.baseline.as_ref().map(|p| load_report_or_abort(p));
-
-    let mut program = load_workload_script(&conf.workload, &conf.params)?;
-
-    let mut functions = Vec::new();
-    let mut functions_to_invoke = Vec::new();
-    for f in &conf.functions {
-        functions_to_invoke.push((f.name.as_str(), f.weight));
-        let function = FnRef::new(f.name.as_str());
-        if !program.has_function(&function) {
-            eprintln!(
-                "error: Function {} not found in the workload script.",
-                f.name.as_str()
-            );
-            exit(255);
-        }
-        functions.push((function, f.weight))
-    }
-
-    // NOTE: prefer the tags, as they are what a caller labels a particular run with,
-    //       and fall back to the functions when no tag was given.
-    //       The 'tag--'/'fn--' prefix says which of the two a reader is looking at.
-    let client_id = if conf.tags.is_empty() {
-        format!("fn--{}", conf.functions.iter().join(","))
-    } else {
-        format!("tag--{}", conf.tags.join(","))
-    };
-    let (session, cluster_info) = connect(&conf.connection, &client_id).await?;
-
-    // NOTE: Add info about the target rune functions to the context
-    //       for the more flexible tweaking of the 'prepare' rune function.
-    match session.data.borrow_mut::<rune::runtime::Object>() {
-        Ok(mut obj) => {
-            let _ = obj.insert(
-                rune::alloc::String::try_from("functions_to_invoke")?,
-                rune::to_value(functions_to_invoke)?,
-            );
-        }
-        Err(_) => {
-            eprintln!("error: session.data is not a Rune Object");
-            exit(255);
-        }
-    }
-
-    if let Some(cluster_info) = cluster_info {
-        conf.cluster_name = Some(cluster_info.name);
-        conf.db_version = Some(cluster_info.db_version);
-    }
-
-    if program.has_prepare() {
-        eprintln!("info: Preparing...");
-        if let Err(e) = program.prepare(&session).await {
-            eprintln!("error: Failed to prepare: {e}");
-            exit(255);
-        }
-    }
-
-    let runner = Workload::new(session.clone()?, program.clone(), &functions);
-    if conf.warmup_duration.is_not_zero() {
-        eprintln!("info: Warming up...");
-        let warmup_options = ExecutionOptions {
-            duration: conf.warmup_duration,
-            cycle_range: (conf.start_cycle, conf.end_cycle),
-            rate: None,
-            rate_sine_amplitude: conf.rate.rate_sine_amplitude,
-            rate_sine_period: conf.rate.rate_sine_period,
-            threads: conf.threads,
-            concurrency: conf.concurrency,
-        };
-        par_execute(
-            "Warming up...",
-            &warmup_options,
-            Interval::Unbounded,
-            runner.clone()?,
-            !conf.quiet,
-            false,
-            &mut None,
-        )
-        .await?;
-    }
-
-    eprintln!("info: Running benchmark...");
-
-    println!(
-        "{}",
-        RunConfigCmp {
-            v1: &conf,
-            v2: compare.as_ref().map(|c| &c.conf),
-        }
-    );
-
-    let exec_options = ExecutionOptions {
-        duration: conf.run_duration,
-        cycle_range: (conf.start_cycle, conf.end_cycle),
-        concurrency: conf.concurrency,
-        rate: conf.rate.rate,
-        rate_sine_amplitude: conf.rate.rate_sine_amplitude,
-        rate_sine_period: conf.rate.rate_sine_period,
-        threads: conf.threads,
-    };
-
-    report::print_log_header();
-    let stats = match conf.hdrfile {
-        Some(ref hdrfile) => {
-            let path = Path::new(&hdrfile);
-            if let Some(parent_dir) = path.parent() {
-                fs::create_dir_all(parent_dir)
-                    .map_err(|e| LatteError::LogFileCreate(hdrfile.clone(), e))?;
-            }
-            let hdrfile = File::create(hdrfile)
-                .map_err(|e| LatteError::LogFileCreate(hdrfile.to_path_buf(), e))?;
-            let (non_blocking_writer, _hdrh_guard) = tracing_appender::non_blocking(hdrfile);
-            let non_blocking_writer = Box::new(non_blocking_writer);
-            let serializer = Box::new(V2DeflateSerializer::new());
-            let system_time_now = SystemTime::now();
-            let hdrh_writer = interval_log::IntervalLogWriterBuilder::new()
-                .add_comment(format!("[Logged with Latte {VERSION}]").as_str())
-                .with_start_time(system_time_now)
-                .with_base_time(system_time_now)
-                .with_max_value_divisor(1000000.0) // ms
-                .begin_log_with(Box::leak(non_blocking_writer), Box::leak(serializer))
-                .unwrap();
-            let boxed_hdrh_writer: Box<dyn HistogramWriter + Send + Sync> = Box::new(hdrh_writer);
-
-            par_execute(
-                "Running...",
-                &exec_options,
-                conf.sampling_interval,
-                runner,
-                !conf.quiet,
-                conf.generate_report,
-                &mut Some(boxed_hdrh_writer),
-            )
-            .await
-        }
-        None => {
-            par_execute(
-                "Running...",
-                &exec_options,
-                conf.sampling_interval,
-                runner,
-                !conf.quiet,
-                conf.generate_report,
-                &mut None,
-            )
-            .await
-        }
-    };
-    let stats = match stats {
-        Ok(stats) => stats,
-        Err(e) => {
-            return Err(e);
-        }
-    };
-
-    let stats_cmp = BenchmarkCmp {
-        v1: &stats,
-        v2: compare.as_ref().map(|c| &c.result),
-    };
-    println!();
-    println!("{}", &stats_cmp);
-
-    if stats_cmp.v1.log.len() > 1 {
-        let path = conf
-            .output
-            .clone()
-            .unwrap_or_else(|| PathBuf::from(format!("latte-{}.json", conf.id.as_ref().unwrap())));
-
-        let report = Report::new(conf, stats);
-        match report.save(&path) {
-            Ok(()) => {
-                eprintln!("info: Saved report to {}", path.display());
-            }
-            Err(e) => {
-                eprintln!("error: Failed to save report to {}: {}", path.display(), e);
-                exit(1);
-            }
-        }
-    }
-    Ok(())
-}
-
-async fn list(conf: ListCommand) -> Result<()> {
-    let max_depth = if conf.recursive { usize::MAX } else { 1 };
-
-    // Loading reports is a bit slow, so we do it in parallel:
-    let mut report_futures = FuturesUnordered::new();
-    for path in &conf.output {
-        let walk = WalkDir::new(path).max_depth(max_depth);
-        for entry in walk.into_iter().flatten() {
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            if entry.path().extension() != Some(OsStr::new("json")) {
-                continue;
-            }
-
-            let path = entry.path().to_path_buf();
-            report_futures.push(spawn_blocking(move || (path.clone(), Report::load(&path))));
-        }
-    }
-
-    let mut reports = Vec::new();
-    while let Some(report) = report_futures.next().await {
-        match report.unwrap() {
-            (path, Ok(report)) if should_list(&report, &conf) => {
-                reports.push(PathAndSummary(path, report.summary()))
-            }
-            (path, Err(e)) => eprintln!("Failed to load report {}: {}", path.display(), e),
-            _ => {}
-        };
-    }
-
-    if !reports.is_empty() {
-        reports.sort_unstable_by_key(|s| {
-            (
-                s.1.workload.clone(),
-                s.1.functions.clone(),
-                s.1.params.clone(),
-                s.1.tags.clone(),
-                s.1.timestamp,
-            )
-        });
-        let mut table = Table::new(PathAndSummary::COLUMNS);
-        table.align(7, Alignment::Right);
-        table.align(8, Alignment::Right);
-        table.align(9, Alignment::Right);
-        for r in reports {
-            table.push(r);
-        }
-        println!("{table}");
-    }
-    Ok(())
-}
-
-fn should_list(report: &Report, conf: &ListCommand) -> bool {
-    if let Some(workload_pattern) = &conf.workload {
-        if !report
-            .conf
-            .workload
-            .to_string_lossy()
-            .contains(workload_pattern)
-        {
-            return false;
-        }
-    }
-    if let Some(function) = &conf.function {
-        if !report
-            .conf
-            .functions
-            .iter()
-            .map(|f| &f.name)
-            .contains(function)
-        {
-            return false;
-        }
-    }
-    if !conf.tags.is_empty() && !conf.tags.iter().any(|t| report.conf.tags.contains(t)) {
-        return false;
-    }
-    true
-}
-
-async fn show(conf: ShowCommand) -> Result<()> {
-    let report1 = load_report_or_abort(&conf.report);
-    let report2 = conf.baseline.map(|p| load_report_or_abort(&p));
-
-    let config_cmp = RunConfigCmp {
-        v1: &report1.conf,
-        v2: report2.as_ref().map(|r| &r.conf),
-    };
-    println!("{config_cmp}");
-
-    let results_cmp = BenchmarkCmp {
-        v1: &report1.result,
-        v2: report2.as_ref().map(|r| &r.result),
-    };
-    println!("{results_cmp}");
-    Ok(())
-}
-
-/// Reads histograms from the report and dumps them to an hdr log
-async fn export_hdr_log(conf: HdrCommand) -> Result<()> {
-    let tag_prefix = conf.tag.map(|t| t + ".").unwrap_or_default();
-    if tag_prefix.chars().any(|c| ", \n\t".contains(c)) {
-        eprintln!("error: Hdr histogram tags are not allowed to contain commas nor whitespace.");
-        exit(255);
-    }
-
-    let report = load_report_or_abort(&conf.report);
-    let stdout = stdout();
-    let output_file: File;
-    let stdout_stream;
-    let mut out: Box<dyn Write> = match conf.output {
-        Some(path) => {
-            output_file = File::create(&path).map_err(|e| LatteError::OutputFileCreate(path, e))?;
-            Box::new(output_file)
-        }
-        None => {
-            stdout_stream = stdout.lock();
-            Box::new(stdout_stream)
-        }
-    };
-
-    let mut serializer = V2DeflateSerializer::new();
-    let mut log_writer = interval_log::IntervalLogWriterBuilder::new()
-        .add_comment(format!("[Logged with Latte {VERSION}]").as_str())
-        .with_start_time(report.result.start_time.into())
-        .with_base_time(report.result.start_time.into())
-        .with_max_value_divisor(1000000.0) // ms
-        .begin_log_with(&mut out, &mut serializer)
-        .unwrap();
-
-    for sample in &report.result.log {
-        let interval_start_time = Duration::from_millis((sample.time_s * 1000.0) as u64);
-        let interval_duration = Duration::from_millis((sample.duration_s * 1000.0) as u64);
-        log_writer.write_histogram(
-            &sample.cycle_latency.histogram.0,
-            interval_start_time,
-            interval_duration,
-            interval_log::Tag::new(format!("{tag_prefix}cycles").as_str()),
-        )?;
-        log_writer.write_histogram(
-            &sample.request_latency.histogram.0,
-            interval_start_time,
-            interval_duration,
-            interval_log::Tag::new(format!("{tag_prefix}requests").as_str()),
-        )?;
-    }
-    Ok(())
-}
-
-async fn print_version(conf: VersionCommand) -> Result<()> {
-    println!("{}", get_formatted_version_info(conf.json));
-    Ok(())
-}
-
-async fn async_main(run_id: String, command: Command) -> Result<()> {
-    match command {
-        Command::Edit(config) => edit(config)?,
-        Command::Schema(config) => schema(config).await?,
-        Command::Load(config) => load(config).await?,
-        Command::Run(mut config) => {
-            config.id = Some(run_id);
-            run(config).await?
-        }
-        Command::List(config) => list(config).await?,
-        Command::Show(config) => show(config).await?,
-        Command::Hdr(config) => export_hdr_log(config).await?,
-        Command::Plot(config) => plot_graph(config).await?,
-        Command::Version(config) => print_version(config).await?,
-    }
-    Ok(())
-}
-
-fn edit(config: EditCommand) -> Result<()> {
-    let workload = find_workload(&config.workload)
-        .canonicalize()
-        .unwrap_or_else(|_| config.workload.to_path_buf());
-    File::open(&workload).map_err(|err| LatteError::ScriptRead(workload.clone(), err.into()))?;
-    edit_workload(workload)
-}
-
-fn edit_workload(workload: PathBuf) -> Result<()> {
-    let editor = env::var("LATTE_EDITOR")
-        .or_else(|_| env::var("EDITOR"))
-        .unwrap_or("vi".to_string());
-    std::process::Command::new(&editor)
-        .current_dir(workload.parent().unwrap_or(Path::new(".")))
-        .arg(workload)
-        .status()
-        .map_err(|e| LatteError::ExternalEditorLaunch(editor, e))?;
-    Ok(())
-}
-
-fn init_runtime(thread_count: usize) -> std::io::Result<Runtime> {
-    if thread_count == 1 {
-        Builder::new_current_thread().enable_all().build()
-    } else {
-        Builder::new_multi_thread()
-            .worker_threads(thread_count)
-            .enable_all()
-            .enable_alt_timer()
-            .build()
-    }
-}
-
-fn setup_logging(run_id: &str, config: &AppConfig) -> Result<WorkerGuard> {
-    let log_file = match &config.log_file {
-        Some(file) if file.is_absolute() => file.clone(),
-        Some(file) => config.log_dir.clone().join(file),
-        None => config.log_dir.join(format!("latte-{run_id}.log")),
-    };
-    fs::create_dir_all(&config.log_dir)
-        .map_err(|e| LatteError::LogFileCreate(log_file.clone(), e))?;
-    let log_file = File::create(&log_file).map_err(|e| LatteError::LogFileCreate(log_file, e))?;
-    let (non_blocking, guard) = tracing_appender::non_blocking(log_file);
-
-    let filter = EnvFilter::builder()
-        .with_default_directive(LevelFilter::INFO.into())
-        .with_env_var("LATTE_LOG")
-        .from_env()
-        .map_err(|e| LatteError::Configuration(e.to_string()))?
-        .add_directive("rune=off".parse().unwrap()); // turn off rune tracing for performance reasons
-
-    tracing_subscriber::fmt()
-        .with_ansi(false)
-        .with_writer(non_blocking)
-        .with_env_filter(filter)
-        .init();
-    Ok(guard)
-}
-
-fn run_id() -> String {
-    chrono::Local::now().format("%Y%m%d-%H%M%S-%3f").to_string()
 }
 
 fn main() {
-    // NOTE: use 2 new lines because 'latte --version' concatenates the app name and its version
-    let boxed_version = format!("\n\n{}", format_version_info_human()).into_boxed_str();
-    let static_version: &'static str = Box::leak(boxed_version);
-    let app_cmd = AppConfig::command().version(static_version);
-    let app_cmd_matches = app_cmd.get_matches();
-    let config = AppConfig::from_arg_matches(&app_cmd_matches).expect("Failed to parse arguments");
-
-    let run_id = run_id();
-    let _guard = if config.enable_logging {
-        match setup_logging(run_id.as_str(), &config) {
-            Ok(guard) => Some(guard),
-            Err(e) => {
-                eprintln!("error: {e}");
-                exit(1);
-            }
+    let mut run = match start(std::env::args().collect()) {
+        Start::Exit(code) => exit(code),
+        Start::Driver(run) => run,
+    };
+    if backend() != HOST_BACKEND {
+        eprintln!(
+            "error: the workload needs the {} backend, and this host serves {}",
+            backend().name(),
+            HOST_BACKEND.name()
+        );
+        exit(2);
+    }
+    let runtime = match driver_runtime(thread_hint(&run).get()) {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            eprintln!("error: {e}");
+            exit(128);
         }
-    } else {
-        None
     };
-
-    let command = config.command;
-    let thread_count = match &command {
-        Command::Run(cmd) => cmd.threads.get(),
-        Command::Load(cmd) => cmd.threads.get(),
-        _ => 1,
+    let token = run.cancel_token();
+    cancel_on_signals(&runtime, token.clone());
+    let driver = match runtime.block_on(db::connect(run.connection(), run.client_id())) {
+        Ok(driver) => driver,
+        Err(e) => {
+            eprintln!("error: {e}");
+            exit(128);
+        }
     };
-    let runtime = init_runtime(thread_count);
-    if let Err(e) = runtime.unwrap().block_on(async_main(run_id, command)) {
+    let settings = db::driver_settings(run.connection()).to_string();
+    if let Err(e) = run.set_driver_settings(settings.as_bytes()) {
         eprintln!("error: {e}");
         exit(128);
     }
+    let driver = Arc::new(driver);
+    while let Some(phase) = run.begin_phase() {
+        let instances: Vec<_> = (0..phase.instances)
+            .filter_map(|i| run.take_instance(i))
+            .collect();
+        std::thread::scope(|scope| {
+            for (i, instance) in instances.into_iter().enumerate() {
+                let driver = Arc::clone(&driver);
+                let token = token.clone();
+                let spawned = std::thread::Builder::new()
+                    .name(format!("latte-worker-{i}"))
+                    .spawn_scoped(scope, move || run_worker(driver, instance, token));
+                if let Err(e) = spawned {
+                    eprintln!("error: failed to start worker thread {i}: {e}");
+                }
+            }
+        });
+        if !run.end_phase() {
+            break;
+        }
+    }
+    let code = run.finish();
+    drop(driver);
+    drop(runtime);
+    exit(code);
 }
