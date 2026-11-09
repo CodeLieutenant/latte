@@ -3,7 +3,7 @@
 //! cancel latency.
 
 use std::collections::HashMap;
-use std::ffi::{c_char, c_int, CString};
+use std::ffi::c_int;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -15,7 +15,7 @@ use latte_core::exec::workload::{FnRef, Program};
 use latte_core::ffi::{self, LatteRecord, LatteRing};
 use latte_core::native::Json;
 use latte_core::ops::{
-    ClientKind, Completion, DriverError, ErrorCategory, Op, OpKind, Response, Rows,
+    BytePool, ClientKind, Completion, DriverError, ErrorCategory, Op, OpKind, Response, Rows,
 };
 use latte_core::scylla_cql_core::frame::response::result::{
     ColumnSpec, ColumnType, NativeType, TableSpec,
@@ -65,7 +65,7 @@ fn answer(op: Op) -> Completion {
                 TableSpec::owned("latte".to_string(), "basic".to_string()),
             )],
         },
-        OpKind::Alternator { .. } => Response::Json(Json::Text(String::new())),
+        OpKind::Alternator { .. } => Response::Json(Json::Text(Default::default())),
         OpKind::Datacenters => Response::Datacenters(Vec::new()),
         _ => Response::Page {
             rows: Rows::default(),
@@ -170,11 +170,11 @@ fn bench_pump(c: &mut Criterion) {
     drop(run);
 
     // The C ABI: rings, records, the in-use flag and the inbox.
-    let args: Vec<CString> = run_args(1)
-        .into_iter()
-        .map(|a| CString::new(a).unwrap())
+    let args = run_args(1);
+    let argv: Vec<ffi::LatteStr> = args
+        .iter()
+        .map(|a| ffi::LatteStr::from(a.as_str()))
         .collect();
-    let argv: Vec<*const c_char> = args.iter().map(|a| a.as_ptr()).collect();
     unsafe {
         let mut code = 0;
         let run = ffi::latte_main(argv.len() as c_int, argv.as_ptr(), &mut code);
@@ -347,9 +347,47 @@ fn bench_records(c: &mut Criterion) {
         ..LatteRecord::default()
     };
     let arena = [0u8; 8];
+    let pool = BytePool::new();
     group.bench_function("completion_read", |b| {
-        b.iter(|| ffi::decode_completion(std::hint::black_box(&rec), &arena).unwrap())
+        b.iter(|| ffi::decode_completion(&pool, std::hint::black_box(&rec), &arena).unwrap())
     });
+    // A page with row data and a paging state, from the ring arena.
+    for size in [1024usize, 64 * 1024] {
+        let bytes = vec![7u8; size + 32];
+        let rec = LatteRecord {
+            id: 1,
+            kind: ffi::LATTE_STATUS_OK,
+            flags: ffi::LATTE_RESP_PAGE,
+            rows: 3,
+            paging_off: 0,
+            paging_len: 32,
+            data_off: 32,
+            data_len: size as u32,
+            ..LatteRecord::default()
+        };
+        // An empty column-spec list (u16 0) starts the data, then the row bytes.
+        let mut bytes = bytes;
+        bytes[32] = 0;
+        bytes[33] = 0;
+        group.bench_function(BenchmarkId::new("completion_read_rows", size), |b| {
+            b.iter(|| ffi::decode_completion(&pool, std::hint::black_box(&rec), &bytes).unwrap())
+        });
+        // The same page in a buffer from `latte_reserve`: the rows move, with no copy. The
+        // buffer is made outside the timed part, as the host fills it.
+        group.bench_function(
+            BenchmarkId::new("completion_read_rows_reserved", size),
+            |b| {
+                b.iter_batched(
+                    || bytes.clone(),
+                    |buf| {
+                        ffi::decode_completion_owned(&pool, std::hint::black_box(&rec), buf)
+                            .unwrap()
+                    },
+                    criterion::BatchSize::SmallInput,
+                )
+            },
+        );
+    }
     group.finish();
 }
 
@@ -442,7 +480,7 @@ fn bench_values_and_rows(c: &mut Criterion) {
         let rows = Rows {
             row_count: 1,
             specs: specs.clone(),
-            data,
+            data: data.into(),
             objects: None,
         };
         group.bench_function(BenchmarkId::new("decode_row", name), |b| {

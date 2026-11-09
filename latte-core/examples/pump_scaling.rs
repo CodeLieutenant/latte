@@ -24,7 +24,7 @@ fn answer(op: Op) -> Completion {
                 TableSpec::owned("latte".to_string(), "basic".to_string()),
             )],
         },
-        OpKind::Alternator { .. } => Response::Json(Json::Text(String::new())),
+        OpKind::Alternator { .. } => Response::Json(Json::Text(Default::default())),
         OpKind::Datacenters => Response::Datacenters(Vec::new()),
         _ => Response::Page {
             rows: Rows::default(),

@@ -92,7 +92,7 @@ fn answer(op: Op, host: Host) -> Completion {
         }
         OpKind::Batch { .. } => Response::Done,
         OpKind::Datacenters => Response::Datacenters(vec!["dc1".to_string()]),
-        OpKind::Alternator { .. } => Response::Json(Json::Text(String::new())),
+        OpKind::Alternator { .. } => Response::Json(Json::Text(Default::default())),
     };
     Completion {
         id: op.id,

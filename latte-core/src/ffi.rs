@@ -20,9 +20,10 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::ffi::{c_char, c_int, CStr};
+use std::ffi::c_int;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::Mutex;
 
@@ -34,10 +35,12 @@ use crate::clock;
 use crate::exec::instance::{Instance, PumpStatus};
 use crate::exec::run::{self, Run, Start};
 use crate::exec::runtime::CancelToken;
-use crate::ops::{ClientKind, Completion, DriverError, Op, OpKind, Response, Rows};
+use crate::ops::{
+    BytePool, ClientKind, Completion, CoreBytes, CoreStr, DriverError, Op, OpKind, Response, Rows,
+};
 
 /// Version of this ABI. A host refuses to run with a core of another version.
-pub const LATTE_ABI_VERSION: u32 = 3;
+pub const LATTE_ABI_VERSION: u32 = 4;
 
 /// `latte_pump` results. Negative values are errors.
 pub const LATTE_OK: c_int = 0;
@@ -251,11 +254,109 @@ impl LatteRing {
     }
 }
 
+/// Borrowed UTF-8 text: `len` bytes at `ptr`, with no NUL terminator. `ptr` may be null when
+/// `len` is 0. The side that makes it keeps the bytes alive; each function that takes or
+/// returns one states for how long.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct LatteStr {
+    pub ptr: *const u8,
+    pub len: usize,
+}
+
+impl LatteStr {
+    pub const EMPTY: LatteStr = LatteStr {
+        ptr: ptr::null(),
+        len: 0,
+    };
+
+    /// The bytes.
+    ///
+    /// # Safety
+    /// `ptr` must point to `len` readable bytes that stay alive and unchanged for `'a`.
+    pub unsafe fn as_bytes<'a>(&self) -> &'a [u8] {
+        if self.ptr.is_null() || self.len == 0 {
+            &[]
+        } else {
+            std::slice::from_raw_parts(self.ptr, self.len)
+        }
+    }
+
+    /// The text, checked to be UTF-8.
+    ///
+    /// # Safety
+    /// The same as [`LatteStr::as_bytes`].
+    pub unsafe fn as_str<'a>(&self) -> Result<&'a str, std::str::Utf8Error> {
+        std::str::from_utf8(self.as_bytes())
+    }
+}
+
+impl Default for LatteStr {
+    fn default() -> Self {
+        LatteStr::EMPTY
+    }
+}
+
+impl From<&str> for LatteStr {
+    /// Borrows `s`. The result is valid while `s` is.
+    fn from(s: &str) -> Self {
+        LatteStr {
+            ptr: s.as_ptr(),
+            len: s.len(),
+        }
+    }
+}
+
+/// Borrowed bytes: `len` bytes at `ptr`. `ptr` may be null when `len` is 0. The side that
+/// makes it keeps the bytes alive; each function that takes or returns one states for how
+/// long.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct LatteBytes {
+    pub ptr: *const u8,
+    pub len: usize,
+}
+
+impl LatteBytes {
+    pub const EMPTY: LatteBytes = LatteBytes {
+        ptr: ptr::null(),
+        len: 0,
+    };
+
+    /// The bytes.
+    ///
+    /// # Safety
+    /// `ptr` must point to `len` readable bytes that stay alive and unchanged for `'a`.
+    pub unsafe fn as_bytes<'a>(&self) -> &'a [u8] {
+        if self.ptr.is_null() || self.len == 0 {
+            &[]
+        } else {
+            std::slice::from_raw_parts(self.ptr, self.len)
+        }
+    }
+}
+
+impl Default for LatteBytes {
+    fn default() -> Self {
+        LatteBytes::EMPTY
+    }
+}
+
+impl From<&[u8]> for LatteBytes {
+    /// Borrows `bytes`. The result is valid while `bytes` is.
+    fn from(bytes: &[u8]) -> Self {
+        LatteBytes {
+            ptr: bytes.as_ptr(),
+            len: bytes.len(),
+        }
+    }
+}
+
 /// A run, as seen by a C host. The cancel token sits outside the run so `latte_cancel` never
 /// touches memory another thread may be changing.
 pub struct LatteRun {
     cancel: CancelToken,
-    connection_json: std::ffi::CString,
+    connection_json: String,
     run: std::cell::UnsafeCell<Run>,
 }
 
@@ -281,6 +382,8 @@ struct PumpState {
     scratch: Vec<Op>,
     decoded: Vec<Completion>,
     in_flight: usize,
+    /// Buffers for results copied out of the completion ring.
+    pool: Rc<BytePool>,
 }
 
 thread_local! {
@@ -325,21 +428,12 @@ pub extern "C" fn latte_clock_ns() -> u64 {
     clock::now_ns()
 }
 
-/// Copies the last error of the calling thread into `buf` and returns its full length.
-/// Safe from any thread; each thread has its own last error.
-///
-/// # Safety
-/// `buf` must point to `cap` writable bytes, or be null with `cap` 0.
+/// The last error of the calling thread, with no copy. Empty when there is none. Safe from
+/// any thread; each thread has its own last error. The text stays valid until the calling
+/// thread makes its next call into the core.
 #[no_mangle]
-pub unsafe extern "C" fn latte_last_error(buf: *mut u8, cap: usize) -> usize {
-    LAST_ERROR.with(|e| {
-        let msg = e.borrow();
-        if !buf.is_null() && cap > 0 {
-            let n = msg.len().min(cap);
-            ptr::copy_nonoverlapping(msg.as_ptr(), buf, n);
-        }
-        msg.len()
-    })
+pub extern "C" fn latte_last_error() -> LatteStr {
+    LAST_ERROR.with(|e| LatteStr::from(e.borrow().as_str()))
 }
 
 /// Parses the Latte command line. Commands that need no database run to completion and
@@ -347,16 +441,17 @@ pub unsafe extern "C" fn latte_last_error(buf: *mut u8, cap: usize) -> usize {
 /// Call it from the thread that will drive the run.
 ///
 /// # Safety
-/// `argv` must point to `argc` valid NUL-terminated strings.
+/// `argv` must point to `argc` strings, each valid for the length of the call. The core
+/// keeps no pointer into them.
 #[no_mangle]
 pub unsafe extern "C" fn latte_main(
     argc: c_int,
-    argv: *const *const c_char,
+    argv: *const LatteStr,
     exit_code: *mut c_int,
 ) -> *mut LatteRun {
     guard(ptr::null_mut(), || {
         let args: Vec<String> = (0..argc.max(0) as usize)
-            .map(|i| CStr::from_ptr(*argv.add(i)).to_string_lossy().into_owned())
+            .map(|i| String::from_utf8_lossy((*argv.add(i)).as_bytes()).into_owned())
             .collect();
         match run::start(args) {
             Start::Exit(code) => {
@@ -374,7 +469,7 @@ pub unsafe extern "C" fn latte_main(
                 });
                 Box::into_raw(Box::new(LatteRun {
                     cancel: run.cancel_token(),
-                    connection_json: std::ffi::CString::new(json.to_string()).unwrap_or_default(),
+                    connection_json: json.to_string(),
                     run: std::cell::UnsafeCell::new(*run),
                 }))
             }
@@ -384,15 +479,16 @@ pub unsafe extern "C" fn latte_main(
 
 /// Connection settings as JSON: `backend` ("cql" or "alternator"), `client_id`,
 /// `connection` and `secrets`. A host that does not serve the backend must stop with an
-/// error. Valid until `latte_finish`. Call it from the thread that drives the run.
+/// error. The text is UTF-8 with no NUL terminator, and stays valid until `latte_finish`.
+/// Empty for a null run. Call it from the thread that drives the run.
 ///
 /// # Safety
 /// `run` must come from `latte_main`.
 #[no_mangle]
-pub unsafe extern "C" fn latte_connection_json(run: *const LatteRun) -> *const c_char {
+pub unsafe extern "C" fn latte_connection_json(run: *const LatteRun) -> LatteStr {
     match run.as_ref() {
-        Some(run) => run.connection_json.as_ptr(),
-        None => ptr::null(),
+        Some(run) => LatteStr::from(run.connection_json.as_str()),
+        None => LatteStr::EMPTY,
     }
 }
 
@@ -418,26 +514,23 @@ pub unsafe extern "C" fn latte_is_cancelled(run: *const LatteRun) -> c_int {
     run.as_ref().map_or(0, |r| r.cancel.is_cancelled() as c_int)
 }
 
-/// Stores the effective settings of the host's driver, as a JSON document of `len` bytes.
-/// The core writes them into the report. Returns `LATTE_OK`, or `LATTE_ERR_ARG` when the
-/// text is not valid JSON. Call it from the thread that drives the run.
+/// Stores the effective settings of the host's driver, as a JSON document. The core writes
+/// them into the report. Returns `LATTE_OK`, or `LATTE_ERR_ARG` when the text is not valid
+/// JSON. Call it from the thread that drives the run.
 ///
 /// # Safety
-/// `run` must come from `latte_main`. `json` must point to `len` readable bytes.
+/// `run` must come from `latte_main`. `json` must be valid for the length of the call; the
+/// core keeps no pointer into it.
 #[no_mangle]
-pub unsafe extern "C" fn latte_set_driver_settings(
-    run: *mut LatteRun,
-    json: *const u8,
-    len: usize,
-) -> c_int {
+pub unsafe extern "C" fn latte_set_driver_settings(run: *mut LatteRun, json: LatteStr) -> c_int {
     let Some(run) = run.as_ref() else {
         return LATTE_ERR_ARG;
     };
-    if json.is_null() {
+    if json.ptr.is_null() {
         return LATTE_ERR_ARG;
     }
     guard(LATTE_ERR_PANIC, || {
-        let bytes = std::slice::from_raw_parts(json, len);
+        let bytes = json.as_bytes();
         match (*run.run.get()).set_driver_settings(bytes) {
             Ok(()) => LATTE_OK,
             Err(e) => {
@@ -494,6 +587,7 @@ pub unsafe extern "C" fn latte_take_instance(
                         scratch: Vec::with_capacity(LATTE_RING_RECORDS),
                         decoded: Vec::with_capacity(LATTE_RING_RECORDS),
                         in_flight: 0,
+                        pool: BytePool::new(),
                     }),
                 }))
             }
@@ -639,7 +733,7 @@ unsafe fn pump(inst: &LatteInstance, now_ns: u64, deadline_ns: *mut u64) -> c_in
     state.decoded.clear();
     let ring_len = (state.completions.len as usize).min(LATTE_RING_RECORDS);
     for rec in &state.completions.records[..ring_len] {
-        match decode_record(inst, rec, &state.completions.arena) {
+        match decode_record(inst, &state.pool, rec, &state.completions.arena) {
             Ok(c) => state.decoded.push(c),
             Err(e) => {
                 set_error(e);
@@ -652,7 +746,7 @@ unsafe fn pump(inst: &LatteInstance, now_ns: u64, deadline_ns: *mut u64) -> c_in
     while !batch.is_null() {
         let b = Box::from_raw(batch);
         for rec in b.records.iter() {
-            match decode_record(inst, rec, &b.bytes) {
+            match decode_record(inst, &state.pool, rec, &b.bytes) {
                 Ok(c) => state.decoded.push(c),
                 Err(e) => {
                     set_error(e);
@@ -862,41 +956,90 @@ fn range(bytes: &[u8], off: u32, len: u32) -> Result<&[u8], String> {
 }
 
 /// Decodes one completion. Ranges point into `arena`, or into the reserved buffer of the op
-/// when `buffer` is set; the reserved buffer is freed afterwards.
+/// when `buffer` is set. The reserved buffer moves into the result, with no copy.
 fn decode_record(
     inst: &LatteInstance,
+    pool: &Rc<BytePool>,
     rec: &LatteRecord,
     arena: &[u8],
 ) -> Result<Completion, String> {
-    let reserved = if rec.buffer.is_null() {
-        None
-    } else {
-        let buf = inst
-            .reserved
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&rec.id)
-            .ok_or_else(|| format!("op {} has no reserved buffer", rec.id))?;
-        if !std::ptr::eq(buf.as_ptr(), rec.buffer) {
-            return Err(format!(
-                "op {} points to a buffer it did not reserve",
-                rec.id
-            ));
-        }
-        Some(buf)
-    };
-    let bytes = reserved.as_deref().unwrap_or(arena);
-    decode_completion(rec, bytes)
+    if rec.buffer.is_null() {
+        return decode_completion(pool, rec, arena);
+    }
+    let buf = inst
+        .reserved
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&rec.id)
+        .ok_or_else(|| format!("op {} has no reserved buffer", rec.id))?;
+    if !std::ptr::eq(buf.as_ptr(), rec.buffer) {
+        return Err(format!(
+            "op {} points to a buffer it did not reserve",
+            rec.id
+        ));
+    }
+    decode_completion_owned(pool, rec, buf.into_vec())
 }
 
-/// Decodes one completion whose ranges point into `bytes`.
-pub fn decode_completion(rec: &LatteRecord, bytes: &[u8]) -> Result<Completion, String> {
+/// Where the ranges of a completion point.
+enum Source<'a> {
+    /// The ring arena or an inbox batch, which the core uses again. Values are copied into
+    /// buffers of the pool.
+    Shared(&'a [u8]),
+    /// A buffer from `latte_reserve`. The rows or the JSON move out of it.
+    Owned(Vec<u8>),
+}
+
+impl Source<'_> {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Source::Shared(b) => b,
+            Source::Owned(b) => b,
+        }
+    }
+
+    /// The bytes in `range` as an owned value: moved for an owned buffer, else copied into
+    /// the pool.
+    fn take(self, pool: &Rc<BytePool>, range: std::ops::Range<usize>) -> CoreBytes {
+        match self {
+            Source::Shared(b) => pool.copy(&b[range]),
+            Source::Owned(b) => CoreBytes::from_vec_range(b, range),
+        }
+    }
+}
+
+/// Decodes one completion whose ranges point into `bytes`, a buffer the core uses again.
+/// Rows, paging state and JSON are copied into buffers of `pool`.
+pub fn decode_completion(
+    pool: &Rc<BytePool>,
+    rec: &LatteRecord,
+    bytes: &[u8],
+) -> Result<Completion, String> {
+    decode_source(pool, rec, Source::Shared(bytes))
+}
+
+/// Decodes one completion whose ranges point into `buf`, a buffer the core now owns. The rows
+/// or the JSON keep `buf` with no copy.
+pub fn decode_completion_owned(
+    pool: &Rc<BytePool>,
+    rec: &LatteRecord,
+    buf: Vec<u8>,
+) -> Result<Completion, String> {
+    decode_source(pool, rec, Source::Owned(buf))
+}
+
+fn decode_source(
+    pool: &Rc<BytePool>,
+    rec: &LatteRecord,
+    src: Source<'_>,
+) -> Result<Completion, String> {
+    let bytes = src.bytes();
     let text = range(bytes, rec.text_off, rec.text_len)?;
-    let paging = range(bytes, rec.paging_off, rec.paging_len)?;
     let data = range(bytes, rec.data_off, rec.data_len)?;
     let result = match rec.kind {
-        LATTE_STATUS_OK => Ok(decode_response(rec, paging, data)?),
+        LATTE_STATUS_OK => Ok(decode_response(pool, rec, src)?),
         _ => {
+            // Report-only text: one copy each into the error, on the error path only.
             let class = String::from_utf8_lossy(text);
             let message = String::from_utf8_lossy(data);
             let kind = ClientKind::from_u8(rec.client_kind);
@@ -925,7 +1068,14 @@ fn is_dynamodb_type(class: &str) -> bool {
         )
 }
 
-fn decode_response(rec: &LatteRecord, paging: &[u8], data: &[u8]) -> Result<Response, String> {
+fn decode_response(
+    pool: &Rc<BytePool>,
+    rec: &LatteRecord,
+    src: Source<'_>,
+) -> Result<Response, String> {
+    let bytes = src.bytes();
+    let data_start = rec.data_off as usize;
+    let data = range(bytes, rec.data_off, rec.data_len)?;
     let mut buf = data;
     Ok(match rec.flags {
         LATTE_RESP_PREPARED => Response::Prepared {
@@ -937,18 +1087,25 @@ fn decode_response(rec: &LatteRecord, paging: &[u8], data: &[u8]) -> Result<Resp
             } else {
                 read_specs(&mut buf)?
             };
+            let rows_start = data_start + (data.len() - buf.len());
+            let rows_end = data_start + data.len();
+            let paging = range(bytes, rec.paging_off, rec.paging_len)?;
+            // The paging state is small, so it is always copied, and an owned buffer moves
+            // whole into the rows.
+            let paging_state = (!paging.is_empty()).then(|| pool.copy(paging));
+            let data = if rows_start == rows_end {
+                CoreBytes::default()
+            } else {
+                src.take(pool, rows_start..rows_end)
+            };
             Response::Page {
                 rows: Rows {
                     row_count: rec.rows,
                     specs,
-                    data: if buf.is_empty() {
-                        Vec::new()
-                    } else {
-                        buf.to_vec()
-                    },
+                    data,
                     objects: None,
                 },
-                paging_state: (!paging.is_empty()).then(|| paging.to_vec()),
+                paging_state,
             }
         }
         LATTE_RESP_DATACENTERS => {
@@ -959,9 +1116,14 @@ fn decode_response(rec: &LatteRecord, paging: &[u8], data: &[u8]) -> Result<Resp
             }
             Response::Datacenters(names)
         }
-        LATTE_RESP_JSON => Response::Json(crate::ops::Json::Text(
-            String::from_utf8_lossy(data).into_owned(),
-        )),
+        LATTE_RESP_JSON => {
+            let range = data_start..data_start + data.len();
+            let text = match std::str::from_utf8(data) {
+                Ok(_) => CoreStr::from_bytes(src.take(pool, range)).map_err(|e| e.to_string())?,
+                Err(_) => CoreStr::from(String::from_utf8_lossy(data).into_owned()),
+            };
+            Response::Json(crate::ops::Json::Text(text))
+        }
         _ => Response::Done,
     })
 }
@@ -1072,14 +1234,12 @@ mod tests {
     use super::*;
     use crate::ops::AlternatorOp;
     #[cfg(feature = "cql")]
-    use std::ffi::CString;
-    #[cfg(feature = "cql")]
     use std::sync::mpsc;
 
     #[cfg(feature = "cql")]
     /// Starts `latte run` of `script` through the C ABI and returns the run handle.
     unsafe fn start_run(script: &str, cycles: &str) -> *mut LatteRun {
-        let args: Vec<CString> = [
+        let args: Vec<&str> = [
             "latte",
             "run",
             script,
@@ -1090,10 +1250,8 @@ mod tests {
             "0",
             "-q",
         ]
-        .iter()
-        .map(|a| CString::new(*a).unwrap())
-        .collect();
-        let argv: Vec<*const c_char> = args.iter().map(|a| a.as_ptr()).collect();
+        .to_vec();
+        let argv: Vec<LatteStr> = args.iter().map(|a| LatteStr::from(*a)).collect();
         let mut code = 0;
         let run = latte_main(argv.len() as c_int, argv.as_ptr(), &mut code);
         assert!(!run.is_null(), "latte_main exited with {code}");
@@ -1237,9 +1395,92 @@ mod tests {
             data_len: 9,
             ..LatteRecord::default()
         };
-        let c = decode_completion(&rec, &bytes).unwrap();
+        let c = decode_completion(&BytePool::new(), &rec, &bytes).unwrap();
         let e = c.result.unwrap_err();
         assert_eq!(e.category, crate::ops::ErrorCategory::ReadTimeout);
         assert_eq!(e.message, "timed out");
+    }
+
+    /// A page with a 4-byte paging state, then an empty column-spec list and `rows` bytes.
+    fn page_bytes(rows: usize) -> (LatteRecord, Vec<u8>) {
+        let mut bytes = vec![9u8; 4 + 2 + rows];
+        bytes[4] = 0;
+        bytes[5] = 0;
+        let rec = LatteRecord {
+            id: 1,
+            kind: LATTE_STATUS_OK,
+            flags: LATTE_RESP_PAGE,
+            rows: 1,
+            paging_off: 0,
+            paging_len: 4,
+            data_off: 4,
+            data_len: (2 + rows) as u32,
+            ..LatteRecord::default()
+        };
+        (rec, bytes)
+    }
+
+    #[test]
+    fn reserved_rows_move_without_copy() {
+        let (rec, bytes) = page_bytes(100);
+        let rows_ptr = bytes[6..].as_ptr();
+        let c = decode_completion_owned(&BytePool::new(), &rec, bytes).unwrap();
+        let Ok(Response::Page { rows, paging_state }) = c.result else {
+            panic!("expected a page");
+        };
+        assert_eq!(rows.data.as_ptr(), rows_ptr);
+        assert_eq!(rows.data.len(), 100);
+        assert_eq!(paging_state.as_deref(), Some(&[9u8; 4][..]));
+    }
+
+    #[test]
+    fn arena_rows_reuse_pool_buffers() {
+        let (rec, bytes) = page_bytes(100);
+        let pool = BytePool::new();
+        let first = decode_completion(&pool, &rec, &bytes).unwrap();
+        let Ok(Response::Page { rows, paging_state }) = first.result else {
+            panic!("expected a page");
+        };
+        let first_ptr = rows.data.as_ptr();
+        assert_eq!(&*rows.data, &bytes[6..]);
+        drop(rows);
+        drop(paging_state);
+        // The paging state's buffer and the rows' buffer are both back in the pool.
+        assert_eq!(pool.len(), 2);
+        let second = decode_completion(&pool, &rec, &bytes).unwrap();
+        let Ok(Response::Page { rows, paging_state }) = second.result else {
+            panic!("expected a page");
+        };
+        let ptrs = [rows.data.as_ptr(), paging_state.as_ref().unwrap().as_ptr()];
+        assert!(ptrs.contains(&first_ptr));
+        assert_eq!(pool.len(), 0);
+    }
+
+    #[test]
+    fn reserved_json_moves_without_copy() {
+        let json = br#"{"Item":{}}"#.to_vec();
+        let ptr = json.as_ptr();
+        let rec = LatteRecord {
+            id: 1,
+            kind: LATTE_STATUS_OK,
+            flags: LATTE_RESP_JSON,
+            data_len: json.len() as u32,
+            ..LatteRecord::default()
+        };
+        let c = decode_completion_owned(&BytePool::new(), &rec, json).unwrap();
+        let Ok(Response::Json(crate::ops::Json::Text(text))) = c.result else {
+            panic!("expected JSON text");
+        };
+        assert_eq!(text.as_str(), r#"{"Item":{}}"#);
+        assert_eq!(text.as_ptr(), ptr);
+    }
+
+    #[test]
+    fn last_error_borrows_thread_message() {
+        set_error("boom");
+        let e = latte_last_error();
+        assert_eq!(unsafe { e.as_str() }.unwrap(), "boom");
+        set_error(String::new());
+        assert_eq!(latte_last_error().len, 0);
     }
 }

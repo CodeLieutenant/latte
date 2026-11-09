@@ -649,7 +649,7 @@ impl Context {
             RowMode::None
         };
         let mut all_pages_duration = Duration::ZERO;
-        let mut paging_state: Option<Vec<u8>> = None;
+        let mut paging_state: Option<crate::ops::CoreBytes> = None;
         let mut rune_rows = RuneVec::new();
         let mut rows_num: u64 = 0;
         let mut last_rows: Option<Rows> = None;

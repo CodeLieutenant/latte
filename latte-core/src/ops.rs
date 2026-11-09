@@ -9,7 +9,10 @@ use scylla_cql_core::frame::types::RawValue;
 use scylla_cql_core::serialize::row::{RowSerializationContext, SerializeRow, SerializedValues};
 use scylla_cql_core::serialize::writers::RowWriter;
 use scylla_cql_core::serialize::SerializationError;
+use std::cell::RefCell;
 use std::fmt::{Display, Formatter};
+use std::ops::Deref;
+use std::rc::Rc;
 
 pub type OpId = u64;
 
@@ -50,14 +53,14 @@ pub enum OpKind {
     Query {
         cql: String,
         page_size: i32,
-        paging_state: Option<Vec<u8>>,
+        paging_state: Option<CoreBytes>,
         rows: RowMode,
     },
     /// Runs one page of a prepared statement.
     Execute {
         stmt: StmtId,
         values: Values,
-        paging_state: Option<Vec<u8>>,
+        paging_state: Option<CoreBytes>,
         rows: RowMode,
     },
     /// Runs a logged batch of prepared statements.
@@ -183,7 +186,7 @@ pub enum Response {
     },
     Page {
         rows: Rows,
-        paging_state: Option<Vec<u8>>,
+        paging_state: Option<CoreBytes>,
     },
     Datacenters(Vec<String>),
     /// The response JSON of a DynamoDB operation.
@@ -198,7 +201,7 @@ pub enum Response {
 pub struct Rows {
     pub row_count: u64,
     pub specs: Vec<ColumnSpec<'static>>,
-    pub data: Vec<u8>,
+    pub data: CoreBytes,
     /// Rows a native host decoded straight into script objects with
     /// [`crate::native::CoreRow`]. When set, `specs` and `data` are unused.
     pub objects: Option<Vec<rune::Value>>,
@@ -219,7 +222,7 @@ pub trait AlternatorBody: std::fmt::Debug {
 /// gets the typed request and gives the parsed response.
 #[derive(Clone, Debug)]
 pub enum Json {
-    Text(String),
+    Text(CoreStr),
     Value(serde_json::Value),
     /// A request, shared by its retries and pages.
     Request(std::rc::Rc<dyn AlternatorBody>),
@@ -229,7 +232,7 @@ impl Json {
     /// The JSON text, made from the value or the request when needed.
     pub fn text(&self) -> std::borrow::Cow<'_, str> {
         match self {
-            Json::Text(t) => std::borrow::Cow::Borrowed(t),
+            Json::Text(t) => std::borrow::Cow::Borrowed(t.as_str()),
             Json::Value(v) => std::borrow::Cow::Owned(v.to_string()),
             Json::Request(r) => {
                 let mut out = Vec::new();
@@ -249,6 +252,222 @@ impl Json {
             Json::Text(t) => serde_json::from_str(&t),
             Json::Request(r) => Ok(r.to_value()),
         }
+    }
+}
+
+/// Most buffers a [`BytePool`] keeps. More buffers are freed when they come back.
+const POOL_BUFFERS: usize = 256;
+/// Largest buffer a [`BytePool`] keeps. A larger one is freed when it comes back.
+const POOL_BUFFER_BYTES: usize = 1 << 20;
+
+/// Byte buffers of one instance, used again and again. A [`CoreBytes`] that takes its buffer
+/// from the pool gives it back when it drops, so a page of rows copied out of the ring arena
+/// allocates nothing once the pool is warm. The pool belongs to one instance and moves with
+/// it, like every other `Rc` of the instance.
+#[derive(Debug, Default)]
+pub struct BytePool {
+    free: RefCell<Vec<Vec<u8>>>,
+}
+
+impl BytePool {
+    pub fn new() -> Rc<BytePool> {
+        Rc::new(BytePool::default())
+    }
+
+    /// Copies `bytes` into a buffer of the pool.
+    pub fn copy(self: &Rc<Self>, bytes: &[u8]) -> CoreBytes {
+        if bytes.is_empty() {
+            return CoreBytes::default();
+        }
+        let mut buf = self.free.borrow_mut().pop().unwrap_or_default();
+        buf.extend_from_slice(bytes);
+        CoreBytes {
+            end: buf.len() as u32,
+            buf,
+            start: 0,
+            pool: Some(Rc::clone(self)),
+        }
+    }
+
+    fn give_back(&self, mut buf: Vec<u8>) {
+        if buf.capacity() == 0 || buf.capacity() > POOL_BUFFER_BYTES {
+            return;
+        }
+        let mut free = self.free.borrow_mut();
+        if free.len() < POOL_BUFFERS {
+            buf.clear();
+            free.push(buf);
+        }
+    }
+
+    /// Number of buffers ready for use.
+    pub fn len(&self) -> usize {
+        self.free.borrow().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// Owned bytes that the core moves instead of copying. It holds a whole buffer and the
+/// range of it that is the value, so a part of a host buffer from `latte_reserve` becomes a
+/// value with no copy. A value copied from the ring arena takes its buffer from the
+/// [`BytePool`] of the instance and gives it back when it drops.
+#[derive(Default)]
+pub struct CoreBytes {
+    buf: Vec<u8>,
+    start: u32,
+    end: u32,
+    pool: Option<Rc<BytePool>>,
+}
+
+impl CoreBytes {
+    /// Takes `buf` and keeps the bytes in `range`. No copy.
+    ///
+    /// # Panics
+    /// When `range` is outside `buf` or `buf` is 4 GiB or larger.
+    pub fn from_vec_range(buf: Vec<u8>, range: std::ops::Range<usize>) -> CoreBytes {
+        assert!(range.start <= range.end && range.end <= buf.len());
+        let end = u32::try_from(range.end).expect("a value is smaller than 4 GiB");
+        CoreBytes {
+            buf,
+            start: range.start as u32,
+            end,
+            pool: None,
+        }
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        &self.buf[self.start as usize..self.end as usize]
+    }
+
+    /// The bytes as a `Vec`. No copy when the value is the whole buffer.
+    pub fn into_vec(mut self) -> Vec<u8> {
+        if self.start == 0 && self.end as usize == self.buf.len() {
+            self.pool = None;
+            std::mem::take(&mut self.buf)
+        } else {
+            self.as_slice().to_vec()
+        }
+    }
+}
+
+impl Drop for CoreBytes {
+    fn drop(&mut self) {
+        if let Some(pool) = self.pool.take() {
+            pool.give_back(std::mem::take(&mut self.buf));
+        }
+    }
+}
+
+impl Deref for CoreBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl AsRef<[u8]> for CoreBytes {
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl Clone for CoreBytes {
+    /// A clone takes a buffer of the same pool, so it allocates nothing when the pool is warm.
+    fn clone(&self) -> Self {
+        match &self.pool {
+            Some(pool) => pool.copy(self.as_slice()),
+            None => CoreBytes::from(self.as_slice().to_vec()),
+        }
+    }
+}
+
+impl From<Vec<u8>> for CoreBytes {
+    fn from(buf: Vec<u8>) -> Self {
+        let len = buf.len();
+        CoreBytes::from_vec_range(buf, 0..len)
+    }
+}
+
+impl From<&[u8]> for CoreBytes {
+    fn from(bytes: &[u8]) -> Self {
+        CoreBytes::from(bytes.to_vec())
+    }
+}
+
+impl PartialEq for CoreBytes {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl Eq for CoreBytes {}
+
+impl std::fmt::Debug for CoreBytes {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(self.as_slice(), f)
+    }
+}
+
+/// UTF-8 text held in [`CoreBytes`]. The bytes are checked once, when the value is made.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct CoreStr(CoreBytes);
+
+impl CoreStr {
+    /// Checks that `bytes` is UTF-8. No copy.
+    pub fn from_bytes(bytes: CoreBytes) -> Result<CoreStr, std::str::Utf8Error> {
+        std::str::from_utf8(&bytes)?;
+        Ok(CoreStr(bytes))
+    }
+
+    pub fn as_str(&self) -> &str {
+        // SAFETY: every constructor checks the bytes or takes them from a `String`.
+        unsafe { std::str::from_utf8_unchecked(self.0.as_slice()) }
+    }
+
+    pub fn into_bytes(self) -> CoreBytes {
+        self.0
+    }
+}
+
+impl Deref for CoreStr {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl AsRef<str> for CoreStr {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl From<String> for CoreStr {
+    fn from(s: String) -> Self {
+        CoreStr(CoreBytes::from(s.into_bytes()))
+    }
+}
+
+impl From<&str> for CoreStr {
+    fn from(s: &str) -> Self {
+        CoreStr::from(s.to_string())
+    }
+}
+
+impl std::fmt::Debug for CoreStr {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(self.as_str(), f)
+    }
+}
+
+impl Display for CoreStr {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 

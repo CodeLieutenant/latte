@@ -5,7 +5,7 @@ use std::sync::{Arc, RwLock};
 use latte_core::clock;
 use latte_core::native::CoreRow;
 use latte_core::ops::{
-    ClientKind, Completion, DriverError, Op, OpKind, Response, RowMode, Rows, StmtId,
+    ClientKind, Completion, CoreBytes, DriverError, Op, OpKind, Response, RowMode, Rows, StmtId,
 };
 use scylla::client::session::Session;
 use scylla::errors::{DbError, ExecutionError, RequestAttemptError};
@@ -76,16 +76,18 @@ fn other(class: &str, e: impl std::fmt::Display) -> DriverError {
     DriverError::new(0, ClientKind::Other, class, e.to_string())
 }
 
-fn paging(state: &Option<Vec<u8>>) -> PagingState {
+fn paging(state: &Option<CoreBytes>) -> PagingState {
     match state {
         Some(bytes) => PagingState::new_from_raw_bytes(bytes.as_slice()),
         None => PagingState::start(),
     }
 }
 
-fn next_page(response: PagingStateResponse) -> Option<Vec<u8>> {
+fn next_page(response: PagingStateResponse) -> Option<CoreBytes> {
     match response {
-        PagingStateResponse::HasMorePages { state } => state.as_bytes_slice().map(|b| b.to_vec()),
+        PagingStateResponse::HasMorePages { state } => {
+            state.as_bytes_slice().map(|b| CoreBytes::from(b.to_vec()))
+        }
         PagingStateResponse::NoMorePages => None,
     }
 }

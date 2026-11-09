@@ -13,9 +13,9 @@
 
 typedef uint32_t (*latte_abi_version_t)(void);
 typedef uint64_t (*latte_clock_ns_t)(void);
-typedef LatteRun *(*latte_main_t)(int, const char *const *, int *);
-typedef const char *(*latte_connection_json_t)(const LatteRun *);
-typedef int (*latte_set_driver_settings_t)(LatteRun *, const uint8_t *, size_t);
+typedef LatteRun *(*latte_main_t)(int, const LatteStr *, int *);
+typedef LatteStr (*latte_connection_json_t)(const LatteRun *);
+typedef int (*latte_set_driver_settings_t)(LatteRun *, LatteStr);
 typedef int (*latte_begin_phase_t)(LatteRun *);
 typedef LatteInstance *(*latte_take_instance_t)(LatteRun *, int);
 typedef LatteRing *(*latte_ops_t)(LatteInstance *);
@@ -24,6 +24,11 @@ typedef int (*latte_pump_t)(LatteInstance *, uint64_t, uint64_t *);
 typedef void (*latte_instance_free_t)(LatteInstance *);
 typedef int (*latte_end_phase_t)(LatteRun *);
 typedef int (*latte_finish_t)(LatteRun *);
+
+static LatteStr str_of(const char *s) {
+    LatteStr out = {(const uint8_t *)s, strlen(s)};
+    return out;
+}
 
 static void put_u16(uint8_t *buf, uint32_t *len, uint16_t v) {
     buf[(*len)++] = (uint8_t)(v >> 8);
@@ -87,18 +92,22 @@ int main(int argc, char **argv) {
     printf("abi_version=%u\n", latte_abi_version_p());
     if (latte_abi_version_p() != LATTE_ABI_VERSION) return 3;
 
-    const char *args[32] = {argv[2], "run", argv[3]};
-    int nargs = 3;
-    for (int i = 4; i < argc && nargs < 31; i++) args[nargs++] = argv[i];
+    /* The arguments go in as UTF-8 slices, with no NUL terminator needed. */
+    LatteStr args[32];
+    int nargs = 0;
+    args[nargs++] = str_of(argv[2]);
+    args[nargs++] = str_of("run");
+    args[nargs++] = str_of(argv[3]);
+    for (int i = 4; i < argc && nargs < 31; i++) args[nargs++] = str_of(argv[i]);
     int exit_code = -1;
     LatteRun *run = latte_main_p(nargs, args, &exit_code);
     if (!run) {
         fprintf(stderr, "latte_main returned no run, exit %d\n", exit_code);
         return 4;
     }
-    printf("connection=%.60s...\n", latte_connection_json_p(run));
-    const char *settings = "{\"driver\":\"null\"}";
-    if (latte_set_driver_settings_p(run, (const uint8_t *)settings, strlen(settings)) != LATTE_OK)
+    LatteStr conn = latte_connection_json_p(run);
+    printf("connection=%.*s...\n", conn.len < 60 ? (int)conn.len : 60, (const char *)conn.ptr);
+    if (latte_set_driver_settings_p(run, str_of("{\"driver\":\"null\"}")) != LATTE_OK)
         return 6;
 
     unsigned long ops_seen = 0;

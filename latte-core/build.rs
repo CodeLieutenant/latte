@@ -236,10 +236,41 @@ fn generate_header() {
         .write_to_file(Path::new(&crate_dir).join("include/latte.h"));
 }
 
+/// Reads `LATTE_ABI_VERSION` from `src/ffi.rs`, so the library name follows the ABI.
+fn abi_version() -> u32 {
+    let source = fs::read_to_string("src/ffi.rs").expect("read src/ffi.rs");
+    source
+        .lines()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("pub const LATTE_ABI_VERSION: u32 = ")
+        })
+        .and_then(|rest| rest.trim_end_matches(';').trim().parse().ok())
+        .expect("LATTE_ABI_VERSION in src/ffi.rs")
+}
+
+/// Gives the shared library a name that the dynamic linker records in each host.
+/// Linux: the SONAME `liblatte_core.so.<ABI>`. A host that links the library loads only
+/// a core with the same ABI. macOS: the install name `@rpath/liblatte_core.dylib`, so a
+/// host finds the library through its rpath.
+fn set_library_name() {
+    match env::var("CARGO_CFG_TARGET_OS").as_deref() {
+        Ok("linux") => println!(
+            "cargo:rustc-cdylib-link-arg=-Wl,-soname,liblatte_core.so.{}",
+            abi_version()
+        ),
+        Ok("macos") => {
+            println!("cargo:rustc-cdylib-link-arg=-Wl,-install_name,@rpath/liblatte_core.dylib")
+        }
+        _ => {}
+    }
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=src/ffi.rs");
     println!("cargo:rerun-if-changed=cbindgen.toml");
     generate_header();
+    set_library_name();
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=../Cargo.lock");
     println!("cargo:rerun-if-changed=../.git/HEAD");

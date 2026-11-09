@@ -12,7 +12,7 @@ usize_is_size_t = true
 parse_deps = false
 
 [export]
-include = ["LatteRecord", "LatteRing"]
+include = ["LatteRecord", "LatteRing", "LatteBytes"]
 exclude = ["PRINT_RETRY_ERROR_LIMIT", "AlternatorOp"]
 
 [enum]

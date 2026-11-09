@@ -223,7 +223,7 @@ impl Context {
         let duration = Duration::from_nanos(completion.end_ns.saturating_sub(completion.start_ns));
         Ok(match completion.result {
             Ok(Response::Json(body)) => Ok((body, duration)),
-            Ok(Response::Done) => Ok((OpJson::Text(String::new()), duration)),
+            Ok(Response::Done) => Ok((OpJson::Text(Default::default()), duration)),
             Ok(other) => Err(DriverError::core(format!(
                 "Unexpected response from the driver host: {other:?}"
             ))),

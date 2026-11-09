@@ -1,14 +1,16 @@
 //! The per-op path of the core allocates nothing after warm-up: op submit, release, the
-//! C ABI record write and read, completion and wake-up. Script execution (Rune) and row
+//! C ABI record write and read with rows and a paging state, completion and wake-up. Script execution (Rune) and row
 //! decoding into script values are outside this path and are not measured here.
 
 use std::alloc::Layout;
 use std::rc::Rc;
 
 use latte_core::exec::runtime::{BoxTask, CancelToken, Reactor, TaskSet};
-use latte_core::ffi::{decode_completion, encode_op, LatteRecord, LatteRing};
+use latte_core::ffi::{decode_completion, encode_op, LatteRecord, LatteRing, LATTE_RESP_PAGE};
 use latte_core::native::Json;
-use latte_core::ops::{AlternatorOp, Completion, OpKind, Response, RowMode, Rows, Values};
+use latte_core::ops::{
+    AlternatorOp, BytePool, Completion, OpKind, Response, RowMode, Rows, Values,
+};
 use latte_core::scylla_cql_core::serialize::row::SerializedValues;
 
 /// Counts the allocations `f` makes on this thread, through the core's own allocator.
@@ -37,7 +39,10 @@ fn round_trips(kind: fn() -> OpKind, response: fn() -> Response) -> impl FnMut(u
     let cancel = CancelToken::new();
     let mut out = Vec::with_capacity(16);
     let mut op_ring = ring();
+    // A page answer: a 4-byte paging state, then an empty column-spec list and 8 bytes of
+    // rows. Both are copied into buffers of the pool, which come back when they drop.
     let completion_arena = vec![0u8; 16];
+    let pool = BytePool::new();
     move |n: usize| {
         for i in 0..n {
             reactor.set_now(1 + i as u64);
@@ -50,9 +55,14 @@ fn round_trips(kind: fn() -> OpKind, response: fn() -> Response) -> impl FnMut(u
                 encode_op(&mut op_ring, &op).expect("op fits the ring");
                 let rec = LatteRecord {
                     id: op.id,
+                    flags: LATTE_RESP_PAGE,
+                    paging_off: 0,
+                    paging_len: 4,
+                    data_off: 4,
+                    data_len: 10,
                     ..LatteRecord::default()
                 };
-                let decoded = decode_completion(&rec, &completion_arena).unwrap();
+                let decoded = decode_completion(&pool, &rec, &completion_arena).unwrap();
                 std::hint::black_box(decoded);
                 reactor.complete(Completion {
                     id: op.id,
@@ -113,8 +123,8 @@ fn alternator_ops_allocate_nothing() {
     assert_no_allocations(
         || OpKind::Alternator {
             op: AlternatorOp::PutItem,
-            body: Json::Text(String::new()),
+            body: Json::Text(Default::default()),
         },
-        || Response::Json(Json::Text(String::new())),
+        || Response::Json(Json::Text(Default::default())),
     );
 }

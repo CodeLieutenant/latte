@@ -9,7 +9,7 @@
 /*
  Version of this ABI. A host refuses to run with a core of another version.
  */
-#define LATTE_ABI_VERSION 3
+#define LATTE_ABI_VERSION 4
 
 /*
  `latte_pump` results. Negative values are errors.
@@ -173,6 +173,16 @@ typedef struct LatteInstance LatteInstance;
 typedef struct LatteRun LatteRun;
 
 /*
+ Borrowed UTF-8 text: `len` bytes at `ptr`, with no NUL terminator. `ptr` may be null when
+ `len` is 0. The side that makes it keeps the bytes alive; each function that takes or
+ returns one states for how long.
+ */
+typedef struct LatteStr {
+  const uint8_t *ptr;
+  size_t len;
+} LatteStr;
+
+/*
  One op or one completion at a fixed offset in a ring. Hosts read and write the fields in
  place. Numbers inside the arena are big-endian, as in the CQL native protocol.
 
@@ -245,6 +255,16 @@ typedef struct LatteRing {
   uint8_t arena[LATTE_RING_ARENA];
 } LatteRing;
 
+/*
+ Borrowed bytes: `len` bytes at `ptr`. `ptr` may be null when `len` is 0. The side that
+ makes it keeps the bytes alive; each function that takes or returns one states for how
+ long.
+ */
+typedef struct LatteBytes {
+  const uint8_t *ptr;
+  size_t len;
+} LatteBytes;
+
 
 
 #ifdef __cplusplus
@@ -268,13 +288,11 @@ uint32_t latte_abi_version(void);
 uint64_t latte_clock_ns(void);
 
 /*
- Copies the last error of the calling thread into `buf` and returns its full length.
- Safe from any thread; each thread has its own last error.
-
- # Safety
- `buf` must point to `cap` writable bytes, or be null with `cap` 0.
+ The last error of the calling thread, with no copy. Empty when there is none. Safe from
+ any thread; each thread has its own last error. The text stays valid until the calling
+ thread makes its next call into the core.
  */
-size_t latte_last_error(uint8_t *buf, size_t cap);
+struct LatteStr latte_last_error(void);
 
 /*
  Parses the Latte command line. Commands that need no database run to completion and
@@ -282,19 +300,21 @@ size_t latte_last_error(uint8_t *buf, size_t cap);
  Call it from the thread that will drive the run.
 
  # Safety
- `argv` must point to `argc` valid NUL-terminated strings.
+ `argv` must point to `argc` strings, each valid for the length of the call. The core
+ keeps no pointer into them.
  */
-struct LatteRun *latte_main(int argc, const char *const *argv, int *exit_code);
+struct LatteRun *latte_main(int argc, const struct LatteStr *argv, int *exit_code);
 
 /*
  Connection settings as JSON: `backend` ("cql" or "alternator"), `client_id`,
  `connection` and `secrets`. A host that does not serve the backend must stop with an
- error. Valid until `latte_finish`. Call it from the thread that drives the run.
+ error. The text is UTF-8 with no NUL terminator, and stays valid until `latte_finish`.
+ Empty for a null run. Call it from the thread that drives the run.
 
  # Safety
  `run` must come from `latte_main`.
  */
-const char *latte_connection_json(const struct LatteRun *run);
+struct LatteStr latte_connection_json(const struct LatteRun *run);
 
 /*
  Asks the run to stop. A single atomic store: safe from any thread and from a signal
@@ -315,14 +335,15 @@ void latte_cancel(const struct LatteRun *run);
 int latte_is_cancelled(const struct LatteRun *run);
 
 /*
- Stores the effective settings of the host's driver, as a JSON document of `len` bytes.
- The core writes them into the report. Returns `LATTE_OK`, or `LATTE_ERR_ARG` when the
- text is not valid JSON. Call it from the thread that drives the run.
+ Stores the effective settings of the host's driver, as a JSON document. The core writes
+ them into the report. Returns `LATTE_OK`, or `LATTE_ERR_ARG` when the text is not valid
+ JSON. Call it from the thread that drives the run.
 
  # Safety
- `run` must come from `latte_main`. `json` must point to `len` readable bytes.
+ `run` must come from `latte_main`. `json` must be valid for the length of the call; the
+ core keeps no pointer into it.
  */
-int latte_set_driver_settings(struct LatteRun *run, const uint8_t *json, size_t len);
+int latte_set_driver_settings(struct LatteRun *run, struct LatteStr json);
 
 /*
  Starts the next phase. Returns the number of instances to pump, or 0 when the command
