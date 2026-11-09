@@ -271,6 +271,8 @@ fn main() {
     println!("cargo:rerun-if-changed=cbindgen.toml");
     generate_header();
     set_library_name();
+    // A crate that builds the cdylib from this crate reads latte.h and the sources here.
+    println!("cargo:root={}", env::var("CARGO_MANIFEST_DIR").unwrap());
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=../Cargo.lock");
     println!("cargo:rerun-if-changed=../.git/HEAD");

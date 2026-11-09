@@ -5,6 +5,8 @@ version = "0.54.0-scylladb"
 authors = ["Piotr Kołaczkowski <pkolaczk@gmail.com>"]
 edition = "2021"
 license = "Apache-2.0"
+# Gives each dependent build script DEP_LATTE_CORE_ROOT, the directory of this crate.
+links = "latte_core"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
